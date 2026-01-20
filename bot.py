@@ -143,6 +143,18 @@ def get_image_display_duration():
     """Get how long to display generated images before returning to avatar."""
     return get_config("video.image_display_duration", 300)
 
+def get_vision_mode():
+    """Get vision analysis mode: handoff, direct, or local."""
+    return get_config("vision.mode", "handoff")
+
+def get_vision_local_model():
+    """Get local vision model name."""
+    return get_config("vision.local_model", "moondream")
+
+def get_vision_local_model_path():
+    """Get local vision model path."""
+    return get_config("vision.local_model_path", None)
+
 def get_voice_server_url():
     return get_config("server.url", os.getenv("VOICE_SERVER_URL", "http://localhost:8086"))
 
@@ -827,18 +839,26 @@ async def schedule_avatar_return(delay_seconds: int = 60):
 
 async def analyze_video_frame(params) -> dict:
     """
-    Capture the current video frame and hand off to Clawdbot for vision analysis.
-    Saves the frame to disk and triggers a handoff to Clawdbot who has image analysis capability.
+    Capture and analyze the current video frame.
+    
+    Mode is controlled by vision.mode in config.toml:
+    - handoff: send to Clawdbot for analysis (default)
+    - direct: feed image directly to voice LLM (Claude vision)
+    - local: use a local vision model
     """
     global _last_video_frame
     
     if not _last_video_frame:
         return {"status": "error", "message": "No video frame available. Is the camera on?"}
     
+    vision_mode = get_vision_mode()
+    logger.info(f"📸 Analyzing video frame (mode: {vision_mode})")
+    
     try:
         import time
+        import base64
         
-        # Save frame to temp file for Clawdbot to analyze
+        # Save frame to temp file
         timestamp = int(time.time())
         frame_path = f"/tmp/voxio-frame-{timestamp}.jpg"
         
@@ -847,22 +867,96 @@ async def analyze_video_frame(params) -> dict:
         
         logger.info(f"📸 Saved video frame to {frame_path} ({len(_last_video_frame)} bytes)")
         
-        # Create a mock params object for handoff
-        class HandoffParams:
-            def __init__(self):
-                self.arguments = {"task": f"Analyze the image at {frame_path} and describe what you see to the user"}
-        
-        # Directly call handoff to Clawdbot
-        handoff_result = await handoff_to_clawdbot(HandoffParams())
-        
-        return {
-            "status": "handed_off",
-            "frame_path": frame_path,
-            "handoff_result": handoff_result
-        }
+        if vision_mode == "handoff":
+            # Hand off to Clawdbot for analysis
+            class HandoffParams:
+                def __init__(self):
+                    self.arguments = {"task": f"Analyze the image at {frame_path} and describe what you see to the user"}
+            
+            handoff_result = await handoff_to_clawdbot(HandoffParams())
+            
+            return {
+                "status": "handed_off",
+                "frame_path": frame_path,
+                "handoff_result": handoff_result
+            }
+            
+        elif vision_mode == "direct":
+            # Feed image directly to voice LLM via VisionImageRawFrame
+            # The image will be added to the LLM context for inline analysis
+            frame_b64 = base64.b64encode(_last_video_frame).decode('utf-8')
+            
+            return {
+                "status": "analyzing",
+                "mode": "direct",
+                "image_data": frame_b64,
+                "image_type": "image/jpeg",
+                "instruction": "I've captured the image. Describe what you see in detail."
+            }
+            
+        elif vision_mode == "local":
+            # Use local vision model
+            local_model = get_vision_local_model()
+            description = await _analyze_with_local_model(frame_path, local_model)
+            
+            return {
+                "status": "success",
+                "mode": "local",
+                "model": local_model,
+                "description": description
+            }
+        else:
+            return {"status": "error", "message": f"Unknown vision mode: {vision_mode}"}
+            
     except Exception as e:
-        logger.error(f"Video frame capture error: {e}")
+        logger.error(f"Video frame analysis error: {e}")
         return {"status": "error", "message": str(e)}
+
+
+async def _analyze_with_local_model(frame_path: str, model_name: str) -> str:
+    """Analyze image with a local vision model."""
+    logger.info(f"🔍 Analyzing with local model: {model_name}")
+    
+    try:
+        if model_name == "moondream":
+            # Moondream via CLI or Python API
+            result = subprocess.run(
+                ["moondream", "--image", frame_path, "--prompt", "Describe this image in detail."],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            else:
+                return f"Moondream error: {result.stderr}"
+                
+        elif model_name == "llava":
+            # LLaVA via llama.cpp or ollama
+            result = subprocess.run(
+                ["ollama", "run", "llava", f"Describe this image: {frame_path}"],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            else:
+                return f"LLaVA error: {result.stderr}"
+                
+        elif model_name == "florence-2":
+            # Florence-2 - would need custom script
+            return "Florence-2 not yet implemented. Use moondream or llava."
+            
+        else:
+            return f"Unknown local model: {model_name}. Supported: moondream, llava, florence-2"
+            
+    except subprocess.TimeoutExpired:
+        return "Local vision model timed out"
+    except FileNotFoundError:
+        return f"Local model '{model_name}' not installed or not in PATH"
+    except Exception as e:
+        return f"Local vision error: {e}"
 
 
 async def show_generated_image(params) -> dict:
