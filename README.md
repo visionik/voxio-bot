@@ -184,6 +184,162 @@ The assistant is configured as "Vinston Wolf" with these traits:
 
 Edit `VINSTON_SYSTEM_PROMPT` in `bot.py` to customize the personality.
 
+## Network & Security
+
+### Default: Localhost Only
+
+By default, voxio-bot binds to `127.0.0.1` (localhost) for security reasons. This means:
+- ✅ Only local connections are accepted
+- ✅ No external exposure without explicit configuration
+- ✅ Safe for development and home use
+
+To access from other devices, you need a secure tunnel or VPN (see below).
+
+### WebRTC & TURN Servers
+
+WebRTC establishes peer-to-peer connections for real-time audio. In many network configurations (NAT, firewalls, VPNs), direct peer-to-peer connections fail. A **TURN server** relays traffic when direct connections aren't possible.
+
+**When you need TURN:**
+- Behind corporate firewalls
+- Symmetric NAT (common in carrier-grade NAT)
+- VPN connections
+- Mobile networks
+
+**TURN Server Options:**
+
+| Provider | Type | Cost | Notes |
+|----------|------|------|-------|
+| [Cloudflare TURN](https://developers.cloudflare.com/calls/turn/) | Managed | Free tier + usage | Simple setup, global network, **recommended** |
+| [Twilio TURN](https://www.twilio.com/docs/stun-turn) | Managed | Usage-based | Reliable, good docs |
+| [Xirsys](https://xirsys.com/) | Managed | Free tier + paid | Popular for WebRTC |
+| [coturn](https://github.com/coturn/coturn) | Self-hosted | Free | Run your own, requires server |
+| [Pion TURN](https://github.com/pion/turn) | Self-hosted | Free | Go-based, lightweight |
+
+**Cloudflare TURN Setup (what we use):**
+
+1. Enable Cloudflare Calls in your dashboard
+2. Get your TURN credentials:
+   ```bash
+   curl -X POST "https://rtc.live.cloudflare.com/v1/turn/keys/<key-id>/credentials/generate" \
+     -H "Authorization: Bearer <api-token>" \
+     -H "Content-Type: application/json" \
+     -d '{"ttl": 86400}'
+   ```
+3. Configure in your WebRTC client:
+   ```javascript
+   const config = {
+     iceServers: [
+       { urls: 'stun:stun.cloudflare.com:3478' },
+       { 
+         urls: 'turn:turn.cloudflare.com:3478?transport=udp',
+         username: '<username>',
+         credential: '<credential>'
+       }
+     ]
+   };
+   ```
+
+### Secure Remote Access Options
+
+Since voxio-bot only binds to localhost, you need a secure method to access it remotely:
+
+#### Option 1: Tailscale (Recommended for Personal Use)
+
+[Tailscale](https://tailscale.com/) creates a private mesh VPN between your devices.
+
+```bash
+# Install Tailscale on server and client devices
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up
+
+# Access via Tailscale IP
+http://<tailscale-ip>:8086/client
+```
+
+**Pros:** Zero config, encrypted, works through NAT, free for personal use
+**Cons:** Requires Tailscale on all client devices
+
+#### Option 2: Cloudflare Tunnel + Zero Trust (Recommended for Production)
+
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) exposes localhost services through Cloudflare's network with authentication.
+
+```bash
+# Install cloudflared
+brew install cloudflare/cloudflare/cloudflared
+
+# Create tunnel
+cloudflared tunnel create voxio-bot
+cloudflared tunnel route dns voxio-bot voice.yourdomain.com
+
+# Create config (~/.cloudflared/config.yml)
+tunnel: <tunnel-id>
+credentials-file: ~/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: voice.yourdomain.com
+    service: http://localhost:8086
+  - service: http_status:404
+
+# Run tunnel
+cloudflared tunnel run voxio-bot
+```
+
+**Add Zero Trust authentication:**
+1. Go to Cloudflare Zero Trust dashboard
+2. Create an Access Application for `voice.yourdomain.com`
+3. Add authentication (email OTP, SSO, etc.)
+
+**Pros:** Public URL with auth, DDoS protection, global edge
+**Cons:** Requires domain on Cloudflare, more setup
+
+#### Option 3: Nginx Reverse Proxy + WireGuard
+
+For self-hosted infrastructure:
+
+```nginx
+# /etc/nginx/sites-available/voxio-bot
+server {
+    listen 443 ssl;
+    server_name voice.yourdomain.com;
+    
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+    
+    location / {
+        proxy_pass http://127.0.0.1:8086;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+}
+```
+
+Combine with WireGuard VPN for access control.
+
+#### Option 4: SSH Tunnel (Quick & Dirty)
+
+For temporary access:
+
+```bash
+# On client machine
+ssh -L 8086:localhost:8086 user@server
+
+# Then access locally
+http://localhost:8086/client
+```
+
+**Pros:** No additional software, works immediately
+**Cons:** Manual, temporary, requires SSH access
+
+### Security Best Practices
+
+1. **Never bind to 0.0.0.0** without authentication
+2. **Always use HTTPS** in production (Cloudflare Tunnel handles this)
+3. **Enable basic auth** (`run_auth.py` does this by default)
+4. **Rotate TURN credentials** regularly (use short TTLs)
+5. **Monitor active sessions** via `/sessions` endpoint
+6. **Use Zero Trust** for production deployments
+
 ## Troubleshooting
 
 ### "Module not found" errors
@@ -203,6 +359,7 @@ uv sync --reinstall
 
 ### Connection fails
 - WebRTC may be blocked by VPN/firewall
+- **Add a TURN server** (see above) — this fixes most connection issues
 - Try disabling VPN
 - Check if UDP traffic is allowed
 
