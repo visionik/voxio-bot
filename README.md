@@ -1,9 +1,9 @@
-# Vinston Wolf Voice Assistant
+# Voxio Bot
 
 A real-time voice AI assistant powered by:
 - **STT**: OpenAI Whisper (real-time speech recognition)
 - **LLM**: Anthropic Claude (claude-sonnet-4-20250514)
-- **TTS**: ElevenLabs (Roger voice - professional male)
+- **TTS**: ElevenLabs (customizable voice)
 - **Transport**: WebRTC (peer-to-peer)
 - **Framework**: [Pipecat](https://pipecat.ai)
 
@@ -20,7 +20,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### 2. Set up environment
 ```bash
-cd voice-assistant
+cd voxio-bot
 cp .env.example .env
 # Edit .env with your API keys
 ```
@@ -40,7 +40,7 @@ Open http://localhost:8086/client in your browser and click **Connect**.
 
 ## Clawdbot Integration
 
-The voice assistant has bidirectional integration with Clawdbot:
+Voxio Bot has bidirectional integration with Clawdbot:
 
 ### Handoff Tool (Voice → Clawdbot)
 
@@ -58,10 +58,10 @@ Clawdbot can speak results back through active voice sessions:
 
 ```bash
 # Check active sessions
-curl https://voice.ip11.net/sessions
+curl https://voice.example.com/sessions
 
 # Speak to the active session
-curl -X POST https://voice.ip11.net/speak \
+curl -X POST https://voice.example.com/speak \
   -H "Content-Type: application/json" \
   -d '{"text": "You have two meetings tomorrow..."}'
 ```
@@ -99,7 +99,7 @@ curl -X POST https://voice.ip11.net/speak \
 3. Clawdbot receives the task via wake command
 4. Clawdbot performs web search
 5. Clawdbot POSTs results to `/speak`
-6. Voice assistant speaks the results to the user
+6. Voxio Bot speaks the results to the user
 
 ## API Keys Required
 
@@ -132,9 +132,9 @@ curl -X POST https://voice.ip11.net/speak \
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `OPENAI_API_KEY` | OpenAI/Whisper API key |
 | `ELEVENLABS_API_KEY` | ElevenLabs TTS key |
-| `AUTH_USERNAME` | Basic auth username (default: vinston) |
+| `AUTH_USERNAME` | Basic auth username |
 | `AUTH_PASSWORD` | Basic auth password |
-| `VOICE_SERVER_URL` | Public URL for callbacks (default: https://voice.ip11.net) |
+| `VOICE_SERVER_URL` | Public URL for callbacks (e.g., `https://voice.example.com`) |
 
 ### Voice Selection
 
@@ -156,22 +156,22 @@ Claude model can be changed in `bot.py`:
 Voice Activity Detection parameters in `bot.py`:
 - `stop_secs`: Silence duration before considering turn complete (default: 0.3s)
 
-## Vinston Wolf Personality
+## Personality Customization
 
-The assistant is configured as "Vinston Wolf" with these traits:
+The assistant personality is defined in `VINSTON_SYSTEM_PROMPT` in `bot.py`. Default traits:
 - Cool and collected
 - Calm demeanor
 - Professional problem-solver
 - Concise responses (optimized for voice)
 - Friendly but professional
 
-Edit `VINSTON_SYSTEM_PROMPT` in `bot.py` to customize the personality.
+Edit the system prompt to customize for your use case.
 
 ## Network & Security
 
 ### Default: Localhost Only
 
-By default, voxio-bot binds to `127.0.0.1` (localhost) for security reasons. This means:
+By default, Voxio Bot binds to `127.0.0.1` (localhost) for security reasons. This means:
 - ✅ Only local connections are accepted
 - ✅ No external exposure without explicit configuration
 - ✅ Safe for development and home use
@@ -198,7 +198,7 @@ WebRTC establishes peer-to-peer connections for real-time audio. In many network
 | [coturn](https://github.com/coturn/coturn) | Self-hosted | Free | Run your own, requires server |
 | [Pion TURN](https://github.com/pion/turn) | Self-hosted | Free | Go-based, lightweight |
 
-**Cloudflare TURN Setup (what we use):**
+**Cloudflare TURN Setup:**
 
 1. Enable Cloudflare Calls in your dashboard
 2. Get your TURN credentials:
@@ -224,7 +224,7 @@ WebRTC establishes peer-to-peer connections for real-time audio. In many network
 
 ### Secure Remote Access Options
 
-Since voxio-bot only binds to localhost, you need a secure method to access it remotely:
+Since Voxio Bot only binds to localhost, you need a secure method to access it remotely:
 
 #### Option 1: Tailscale (Recommended for Personal Use)
 
@@ -348,19 +348,21 @@ uv sync --reinstall
 
 ### Handoff not working
 - Ensure `clawdbot` command is in PATH
-- Check Clawdbot daemon is running: `clawdbot daemon status`
-- Check logs: `tail -f /tmp/voice-assistant.log`
+- Check Clawdbot is running
+- Check logs: `tail -f /tmp/voxio-bot.log`
 
 ## Project Structure
 
 ```
-voice-assistant/
+voxio-bot/
 ├── bot.py              # Main Pipecat bot with Clawdbot integration
 ├── run_auth.py         # Server runner with auth + /speak endpoint
 ├── pyproject.toml      # Python dependencies
 ├── .env.example        # Environment template
 ├── .env                # Your API keys (gitignored)
-└── README.md           # This file
+├── docs/
+│   └── architecture.png
+└── README.md
 ```
 
 ## License
