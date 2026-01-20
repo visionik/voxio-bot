@@ -47,3 +47,11 @@ image_display_duration = 300
 [vad]
 # Silence duration before turn is considered complete (seconds)
 stop_secs = 0.3
+
+[transport]
+# Transport type: webrtc (local client) or daily (Daily.co/playground)
+type = "webrtc"
+# Port for local WebRTC server (webrtc transport only)
+port = 8086
+# Daily.co room URL (daily transport only, or set DAILY_ROOM_URL env)
+# daily_room_url = "https://your-domain.daily.co/room-name"

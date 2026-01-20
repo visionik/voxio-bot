@@ -870,7 +870,12 @@ async def show_generated_image(params) -> dict:
     Generate and display an image relevant to the conversation.
     Uses nano-banana (Gemini) to create the image.
     """
-    global _current_display_image
+    global _current_display_image, _gif_animation_task
+    
+    # Cancel any running GIF animation first
+    if _gif_animation_task and not _gif_animation_task.done():
+        _gif_animation_task.cancel()
+        logger.info("🖼️ Cancelled GIF animation for new image")
     
     prompt = params.arguments.get("prompt", "")
     if not prompt:
@@ -1617,7 +1622,32 @@ async def bot(runner_args: RunnerArguments):
     await run_bot(transport, runner_args)
 
 
-if __name__ == "__main__":
-    from pipecat.runner.run import main
+def get_transport_type():
+    """Get transport type from config."""
+    return get_config("transport.type", "webrtc")
 
+def get_transport_port():
+    """Get transport port from config."""
+    return get_config("transport.port", 8086)
+
+
+if __name__ == "__main__":
+    import sys
+    
+    # Check if transport args already provided via CLI
+    has_transport_arg = any(arg in sys.argv for arg in ['-t', '--transport'])
+    has_port_arg = any(arg in sys.argv for arg in ['-p', '--port'])
+    
+    # Add config values as defaults if not specified on CLI
+    if not has_transport_arg:
+        transport_type = get_transport_type()
+        sys.argv.extend(['-t', transport_type])
+        logger.info(f"📡 Using transport from config: {transport_type}")
+    
+    if not has_port_arg:
+        port = get_transport_port()
+        sys.argv.extend(['--port', str(port)])
+        logger.info(f"📡 Using port from config: {port}")
+    
+    from pipecat.runner.run import main
     main()
