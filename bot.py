@@ -1607,8 +1607,10 @@ async def bot(runner_args: RunnerArguments):
         "daily": lambda: DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            camera_out_enabled=False,
+            camera_out_enabled=False,  # TODO: Daily video output crashes - investigate
             video_out_enabled=False,
+            camera_in_enabled=VIDEO_IN_ENABLED,
+            video_in_enabled=VIDEO_IN_ENABLED,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
