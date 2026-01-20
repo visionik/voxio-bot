@@ -1,0 +1,47 @@
+# Voxio Bot Configuration (voxio.bot)
+
+[identity]
+name = "Vinston Wolf"
+greeting = "Vinston here. What needs fixing?"
+
+[stt]
+# Provider: openai, mlx-whisper, whisper
+provider = "mlx-whisper"
+# Models: tiny, base, small, medium, large, large-turbo, large-turbo-q4, distil-large
+model = "large-turbo"
+
+[tts]
+# Provider: elevenlabs, piper
+provider = "elevenlabs"
+# Voice ID (for ElevenLabs)
+voice = "QzTKubutNn9TjrB7Xb2Q"
+
+[handoff]
+# Type: none, prompt, ambient
+# - none: no sound while waiting
+# - prompt: generate via ElevenLabs SFX API
+# - ambient: loop random files until response/interruption
+type = "ambient"
+
+# Prompt for type = "prompt" (ElevenLabs sound generation)
+prompt = "soft keyboard typing sounds"
+
+# File list for type = "ambient"
+files = [
+    "sounds/handoff_typing.wav",
+    "sounds/110451__freeborn__paper01.wav",
+    "sounds/377260__johnnypanic__clearing-throat-2.wav",
+    "sounds/414819__bokal__office-drawer.wav",
+]
+
+# Gap between ambient sounds (seconds)
+gap = 0.5
+
+[video]
+input_enabled = false
+output_enabled = false
+avatar = "avatar.png"
+
+[vad]
+# Silence duration before turn is considered complete (seconds)
+stop_secs = 0.3
