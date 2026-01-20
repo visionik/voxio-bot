@@ -38,9 +38,11 @@ files = [
 gap = 0.5
 
 [video]
-input_enabled = false
-output_enabled = false
+input_enabled = true
+output_enabled = true
 avatar = "avatar.png"
+# How long to display generated images before returning to avatar (seconds)
+image_display_duration = 300
 
 [vad]
 # Silence duration before turn is considered complete (seconds)

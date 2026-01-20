@@ -80,7 +80,9 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 logger.info("✅ Silero VAD model loaded")
 
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame, TextFrame, TTSSpeakFrame
+from pipecat.frames.frames import LLMRunFrame, TextFrame, TTSSpeakFrame, InputImageRawFrame, UserImageRawFrame
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -136,6 +138,10 @@ def get_video_out_enabled():
 
 def get_default_avatar_path():
     return get_config("video.avatar", os.getenv("DEFAULT_AVATAR_PATH", "avatar.png"))
+
+def get_image_display_duration():
+    """Get how long to display generated images before returning to avatar."""
+    return get_config("video.image_display_duration", 300)
 
 def get_voice_server_url():
     return get_config("server.url", os.getenv("VOICE_SERVER_URL", "http://localhost:8086"))
@@ -406,8 +412,8 @@ _ambient_sounds_playing: bool = False
 
 
 def stop_ambient_sounds():
-    """Stop the ambient sound loop if running."""
-    global _ambient_sound_task, _ambient_sounds_playing
+    """Stop the ambient sound loop if running and interrupt audio playback."""
+    global _ambient_sound_task, _ambient_sounds_playing, _current_task
     
     if _ambient_sound_task and not _ambient_sound_task.done():
         _ambient_sound_task.cancel()
@@ -415,6 +421,25 @@ def stop_ambient_sounds():
     
     _ambient_sound_task = None
     _ambient_sounds_playing = False
+    
+    # Send interruption frame to stop audio playback
+    if _current_task:
+        try:
+            import asyncio
+            asyncio.create_task(_send_interruption_frame())
+        except Exception as e:
+            logger.warning(f"Could not send interruption frame: {e}")
+
+
+async def _send_interruption_frame():
+    """Send an interruption frame to stop current audio playback."""
+    global _current_task
+    if _current_task:
+        from pipecat.frames.frames import InterruptionTaskFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        # Push upstream to trigger interruption
+        await _current_task.queue_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
+        logger.info("🔇 Sent InterruptionTaskFrame to stop audio")
 
 
 def is_ambient_sounds_playing() -> bool:
@@ -720,6 +745,34 @@ async def play_sound_effect(params) -> dict:
 
 # Store for captured video frames
 _last_video_frame: Optional[bytes] = None
+
+
+class VideoFrameCaptureObserver(BaseObserver):
+    """Observer to capture video frames for later analysis."""
+    
+    _frame_count = 0
+    
+    async def on_push_frame(self, data):
+        """Capture video frames when they pass through the pipeline."""
+        global _last_video_frame
+        
+        frame = data.frame
+        # Check for both InputImageRawFrame and UserImageRawFrame
+        if isinstance(frame, (InputImageRawFrame, UserImageRawFrame)):
+            try:
+                from PIL import Image
+                
+                img = Image.frombytes('RGB', frame.size, frame.image)
+                buffer = io.BytesIO()
+                img.save(buffer, format='JPEG', quality=85)
+                _last_video_frame = buffer.getvalue()
+                
+                # Log only every 60 frames (~1 per second at 60fps)
+                VideoFrameCaptureObserver._frame_count += 1
+                if VideoFrameCaptureObserver._frame_count % 60 == 0:
+                    logger.debug(f"📸 Video frame captured ({len(_last_video_frame)} bytes)")
+            except Exception as e:
+                logger.warning(f"Video frame capture error: {e}")
 _current_display_image: Optional[str] = None  # Path to currently displayed image
 _image_display_until: float = 0  # Timestamp when to return to avatar
 _has_greeted: bool = False  # Prevent duplicate greetings
@@ -757,18 +810,25 @@ async def send_default_avatar():
         logger.error(f"Failed to send default avatar: {e}")
 
 
+# Global reference to avatar return task for cancellation
+_avatar_return_task: Optional[asyncio.Task] = None
+
+
 async def schedule_avatar_return(delay_seconds: int = 60):
     """Schedule returning to the default avatar after a delay."""
-    await asyncio.sleep(delay_seconds)
-    global _image_display_until
-    _image_display_until = 0  # Allow avatar to be sent
-    await send_default_avatar()
+    try:
+        await asyncio.sleep(delay_seconds)
+        global _image_display_until
+        _image_display_until = 0  # Allow avatar to be sent
+        await send_default_avatar()
+    except asyncio.CancelledError:
+        logger.info("🖼️ Avatar return cancelled (new image displayed)")
 
 
 async def analyze_video_frame(params) -> dict:
     """
-    Analyze what the user is showing via webcam/screen share.
-    Captures the current video frame and describes what's visible.
+    Capture the current video frame and hand off to Clawdbot for vision analysis.
+    Saves the frame to disk and triggers a handoff to Clawdbot who has image analysis capability.
     """
     global _last_video_frame
     
@@ -776,21 +836,32 @@ async def analyze_video_frame(params) -> dict:
         return {"status": "error", "message": "No video frame available. Is the camera on?"}
     
     try:
-        import base64
+        import time
         
-        # Convert frame to base64 for Claude
-        frame_b64 = base64.b64encode(_last_video_frame).decode('utf-8')
+        # Save frame to temp file for Clawdbot to analyze
+        timestamp = int(time.time())
+        frame_path = f"/tmp/voxio-frame-{timestamp}.jpg"
         
-        # Return the frame data for Claude to analyze inline
-        # The actual analysis happens in the LLM with vision capability
+        with open(frame_path, 'wb') as f:
+            f.write(_last_video_frame)
+        
+        logger.info(f"📸 Saved video frame to {frame_path} ({len(_last_video_frame)} bytes)")
+        
+        # Create a mock params object for handoff
+        class HandoffParams:
+            def __init__(self):
+                self.arguments = {"task": f"Analyze the image at {frame_path} and describe what you see to the user"}
+        
+        # Directly call handoff to Clawdbot
+        handoff_result = await handoff_to_clawdbot(HandoffParams())
+        
         return {
-            "status": "success",
-            "message": "Frame captured. Analyzing what I see...",
-            "frame_data": frame_b64,
-            "frame_type": "image/jpeg"
+            "status": "handed_off",
+            "frame_path": frame_path,
+            "handoff_result": handoff_result
         }
     except Exception as e:
-        logger.error(f"Video analysis error: {e}")
+        logger.error(f"Video frame capture error: {e}")
         return {"status": "error", "message": str(e)}
 
 
@@ -832,9 +903,7 @@ async def show_generated_image(params) -> dict:
             logger.info(f"✅ Image generated: {filename}")
             
             # Queue image to video output if we have a task
-            # DISABLED: OutputImageRawFrame crashes WebRTC mid-session
-            # TODO: Investigate proper video frame streaming or use URL-based display
-            if False and _current_task:
+            if _current_task:
                 try:
                     from pipecat.frames.frames import OutputImageRawFrame
                     from PIL import Image
@@ -865,12 +934,19 @@ async def show_generated_image(params) -> dict:
                     await _current_task.queue_frame(frame)
                     logger.info(f"📺 Image queued to video output: {width}x{height}")
                     
-                    # Set timer to keep image up for 60 seconds
-                    _image_display_until = time.time() + 60
+                    # Set timer to keep image up for configured duration
+                    display_duration = get_image_display_duration()
+                    _image_display_until = time.time() + display_duration
                     
-                    # Schedule return to avatar after 60 seconds (with error handling)
+                    # Cancel any existing avatar return task and schedule new one
+                    global _avatar_return_task
+                    if _avatar_return_task and not _avatar_return_task.done():
+                        _avatar_return_task.cancel()
+                        logger.info("🖼️ Cancelled previous avatar return timer")
+                    
                     try:
-                        asyncio.create_task(schedule_avatar_return(60))
+                        _avatar_return_task = asyncio.create_task(schedule_avatar_return(display_duration))
+                        logger.info(f"🖼️ Image will display for {display_duration} seconds")
                     except Exception as e:
                         logger.warning(f"Could not schedule avatar return: {e}")
                         
@@ -889,6 +965,162 @@ async def show_generated_image(params) -> dict:
         return {"status": "error", "message": "Image generation timed out"}
     except Exception as e:
         logger.error(f"Image generation error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ============================================================================
+# GIF SEARCH AND DISPLAY
+# ============================================================================
+
+_gif_animation_task: Optional[asyncio.Task] = None
+
+
+async def display_gif(params) -> dict:
+    """
+    Search for and display an animated GIF.
+    Uses gifgrep to search Tenor/Giphy, downloads the GIF, and animates it.
+    """
+    global _current_task, _gif_animation_task, _avatar_return_task, _image_display_until
+    
+    query = params.arguments.get("query", "")
+    if not query:
+        return {"status": "error", "message": "No search query provided"}
+    
+    try:
+        import tempfile
+        import time
+        from PIL import Image
+        
+        logger.info(f"🎬 Searching for GIF: {query}")
+        
+        # Use gifgrep to search for GIF URL, then download
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Search for GIF URL
+            result = subprocess.run(
+                ["gifgrep", "search", query, "--max", "1"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            gif_url = result.stdout.strip()
+            if not gif_url or not gif_url.startswith("http"):
+                return {"status": "error", "message": f"No GIF found for '{query}'"}
+            
+            logger.info(f"🎬 Found GIF URL: {gif_url}")
+            
+            # Download the GIF
+            gif_path = f"{tmpdir}/result.gif"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(gif_url) as resp:
+                    if resp.status != 200:
+                        return {"status": "error", "message": f"Failed to download GIF: HTTP {resp.status}"}
+                    gif_data = await resp.read()
+                    with open(gif_path, 'wb') as f:
+                        f.write(gif_data)
+            
+            if not os.path.exists(gif_path):
+                return {"status": "error", "message": f"No GIF found for '{query}'"}
+            
+            logger.info(f"🎬 Downloaded GIF to: {gif_path}")
+            
+            # Load and decode GIF frames
+            gif = Image.open(gif_path)
+            frames = []
+            durations = []
+            
+            try:
+                while True:
+                    # Convert frame to RGB
+                    frame = gif.convert('RGB')
+                    frames.append(frame.copy())
+                    
+                    # Get frame duration (default 100ms)
+                    duration = gif.info.get('duration', 100)
+                    durations.append(duration / 1000.0)  # Convert to seconds
+                    
+                    gif.seek(gif.tell() + 1)
+            except EOFError:
+                pass
+            
+            logger.info(f"🎬 Loaded {len(frames)} frames")
+            
+            if not frames:
+                return {"status": "error", "message": "Could not decode GIF frames"}
+            
+            # Cancel any existing avatar return task
+            if _avatar_return_task and not _avatar_return_task.done():
+                _avatar_return_task.cancel()
+            
+            # Cancel any existing GIF animation
+            if _gif_animation_task and not _gif_animation_task.done():
+                _gif_animation_task.cancel()
+            
+            # Start GIF animation task
+            display_duration = get_image_display_duration()
+            _image_display_until = time.time() + display_duration
+            
+            async def animate_gif():
+                """Loop through GIF frames."""
+                from pipecat.frames.frames import OutputImageRawFrame
+                
+                logger.info(f"🎬 Starting GIF animation: {len(frames)} frames, {display_duration}s duration")
+                
+                try:
+                    end_time = time.time() + display_duration
+                    frame_idx = 0
+                    
+                    while time.time() < end_time:
+                        if not _current_task:
+                            logger.warning("🎬 No current task, stopping animation")
+                            break
+                        
+                        frame = frames[frame_idx % len(frames)]
+                        duration = durations[frame_idx % len(durations)]
+                        
+                        # Send frame
+                        try:
+                            output_frame = OutputImageRawFrame(
+                                image=frame.tobytes(),
+                                size=frame.size,
+                                format="RGB"
+                            )
+                            await _current_task.queue_frame(output_frame)
+                        except Exception as e:
+                            logger.error(f"🎬 Failed to send frame {frame_idx}: {e}")
+                            break
+                        
+                        await asyncio.sleep(duration)
+                        frame_idx += 1
+                        
+                        # Log progress every 10 frames
+                        if frame_idx % 10 == 0:
+                            logger.debug(f"🎬 Animation progress: frame {frame_idx}")
+                    
+                    logger.info(f"🎬 Animation complete, returning to avatar")
+                    
+                    # Return to avatar
+                    global _image_display_until
+                    _image_display_until = 0
+                    await send_default_avatar()
+                    
+                except asyncio.CancelledError:
+                    logger.info("🎬 GIF animation cancelled")
+                except Exception as e:
+                    logger.error(f"🎬 GIF animation error: {e}", exc_info=True)
+            
+            _gif_animation_task = asyncio.create_task(animate_gif())
+            
+            return {
+                "status": "success",
+                "message": f"Now playing GIF for '{query}' ({len(frames)} frames)",
+                "frames": len(frames)
+            }
+            
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "GIF search timed out"}
+    except Exception as e:
+        logger.error(f"GIF display error: {e}")
         return {"status": "error", "message": str(e)}
 
 
@@ -1130,6 +1362,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     llm.register_function("play_sound_effect", play_sound_effect)
     llm.register_function("analyze_video_frame", analyze_video_frame)
     llm.register_function("show_generated_image", show_generated_image)
+    llm.register_function("display_gif", display_gif)
     # DISABLED: change_voice causes pipeline crashes due to dangling async tasks
     # llm.register_function("change_voice", change_voice)
 
@@ -1191,6 +1424,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         required=["prompt"]
     )
     
+    display_gif_schema = FunctionSchema(
+        name="display_gif",
+        description="Search for and display an animated GIF. Use when the user asks for a GIF, animation, or when an animated response would be fun/appropriate.",
+        properties={
+            "query": {
+                "type": "string",
+                "description": "Search query for the GIF, e.g. 'dancing cat', 'thumbs up', 'mind blown', 'wolf howling'"
+            }
+        },
+        required=["query"]
+    )
+    
     change_voice_schema = FunctionSchema(
         name="change_voice",
         description="Change your speaking voice. Available voices: roger (professional), jerry (brash/mischievous), adam (deep), rachel (calm female), bella (soft female), josh (young male), arnold (crisp), sam (raspy).",
@@ -1208,6 +1453,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sound_effect_schema,
         analyze_video_schema,
         show_image_schema,
+        display_gif_schema,
         # change_voice_schema  # DISABLED: causes pipeline crashes
     ]))
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
@@ -1218,7 +1464,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # Build the pipeline: audio in → STT → LLM → TTS → audio out
     pipeline = Pipeline(
         [
-            transport.input(),  # Audio from browser
+            transport.input(),  # Audio/video from browser
             rtvi,  # RTVI protocol handling
             stt,  # Speech-to-text (OpenAI Whisper)
             user_aggregator,  # Collect user messages
@@ -1229,13 +1475,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ]
     )
 
+    # Video frame capture observer
+    video_observer = VideoFrameCaptureObserver()
+    
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[RTVIObserver(rtvi)],
+        observers=[RTVIObserver(rtvi), video_observer],
     )
 
     @transport.event_handler("on_client_connected")
