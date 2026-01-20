@@ -1,10 +1,11 @@
 # Voxio Bot
 
-A real-time voice AI assistant powered by:
-- **STT**: OpenAI Whisper (real-time speech recognition)
-- **LLM**: Anthropic Claude (claude-sonnet-4-20250514)
+A real-time voice AI assistant powered by [Clawdbot](https://github.com/clawdbot/clawdbot):
+- **Brain**: [Clawdbot](https://clawdbot.com) (tools, memory, integrations)
+- **STT**: MLX Whisper / OpenAI Whisper
+- **Voice LLM**: Anthropic Claude (quick responses + handoff)
 - **TTS**: ElevenLabs (customizable voice)
-- **Transport**: WebRTC (peer-to-peer)
+- **Transport**: WebRTC / Daily.co
 - **Framework**: [Pipecat](https://pipecat.ai)
 
 ## Architecture
