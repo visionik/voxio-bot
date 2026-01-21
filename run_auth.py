@@ -1,33 +1,19 @@
 #!/usr/bin/env python3
 """
-Vinston Voice Assistant Runner with Basic Auth + /speak endpoint
+Vinston Voice Assistant Runner with /speak endpoint
 
 Patches Pipecat's _create_server_app to add:
-- Basic Auth middleware
 - /speak POST endpoint for external TTS injection
 - /sessions GET endpoint for session info
+- /h264 custom client endpoint
 """
 
 import os
-import secrets
-import base64
 import asyncio
 from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
-
-# Get auth credentials from env
-AUTH_USERNAME = os.getenv("AUTH_USERNAME", "vinston")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
-
-if not AUTH_PASSWORD:
-    AUTH_PASSWORD = secrets.token_urlsafe(16)
-    print(f"\n⚠️  No AUTH_PASSWORD set. Generated: {AUTH_PASSWORD}")
-    print(f"   Add AUTH_PASSWORD={AUTH_PASSWORD} to .env\n")
-
-print(f"🔐 Basic Auth enabled - username: {AUTH_USERNAME}")
-print(f"🔐 Password: {AUTH_PASSWORD}\n")
 
 # Monkey-patch Pipecat's _create_server_app before importing main
 import pipecat.runner.run as pipecat_runner
@@ -35,59 +21,18 @@ import pipecat.runner.run as pipecat_runner
 _original_create_server_app = pipecat_runner._create_server_app
 
 def _patched_create_server_app(**kwargs):
-    """Wrap the original function to add Basic Auth middleware and /speak endpoint."""
+    """Wrap the original function to add custom endpoints."""
     app = _original_create_server_app(**kwargs)
     
     # Import here to avoid circular imports
-    from fastapi import Request, HTTPException
-    from fastapi.responses import Response, JSONResponse
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette import status
+    from fastapi import Request
+    from fastapi.responses import JSONResponse, FileResponse
     from pydantic import BaseModel
-    
-    # Session tracking is imported lazily in endpoints to avoid conflicts
+    from pathlib import Path
     
     class SpeakRequest(BaseModel):
         text: str
         session_id: Optional[str] = None
-    
-    class BasicAuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
-            # Allow health checks, static files, and certain API paths without auth
-            allowed_paths = ["/health", "/healthz", "/favicon.ico", "/offer", "/ice", "/answer"]
-            # Also allow /speak and /sessions (they have their own simple auth check)
-            api_paths = ["/speak", "/sessions"]
-            
-            if any(request.url.path.startswith(p) for p in allowed_paths + api_paths):
-                return await call_next(request)
-            
-            # Allow WebSocket upgrade requests (for signaling)
-            if request.headers.get("upgrade", "").lower() == "websocket":
-                return await call_next(request)
-            
-            auth_header = request.headers.get("Authorization")
-            
-            if not auth_header or not auth_header.startswith("Basic "):
-                return Response(
-                    content="Authentication required",
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    headers={"WWW-Authenticate": 'Basic realm="Vinston Voice Assistant"'},
-                )
-            
-            credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
-            username, password = credentials.split(":", 1)
-            
-            if username == AUTH_USERNAME and password == AUTH_PASSWORD:
-                return await call_next(request)
-            
-            return Response(
-                content="Invalid credentials",
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": 'Basic realm="Vinston Voice Assistant"'},
-            )
-    
-    # Add the middleware to the FastAPI app
-    app.add_middleware(BasicAuthMiddleware)
     
     # ========================================================================
     # /speak endpoint - Allow Clawdbot to speak through active sessions
@@ -99,43 +44,47 @@ def _patched_create_server_app(**kwargs):
         
         JSON body:
         {
-            "text": "Message to speak",
-            "session_id": "optional - specific session, or uses default"
-        }
-        
-        Returns:
-        {
-            "success": true/false,
-            "session_id": "which session was used",
-            "error": "error message if failed"
+            "text": "Hello world",
+            "session_id": "optional-specific-session"
         }
         """
+        from sessions import get_active_session, speak_to_session
+        
         try:
-            body = await request.json()
-            text = body.get("text")
-            session_id = body.get("session_id")
+            data = await request.json()
+            text = data.get("text", "")
+            session_id = data.get("session_id")
             
             if not text:
                 return JSONResponse(
-                    status_code=400,
-                    content={"success": False, "error": "Missing 'text' field"}
+                    content={"success": False, "error": "No text provided"},
+                    status_code=400
                 )
             
-            # Call the speak function from bot.py
-            from sessions import speak_to_session
-            result = await speak_to_session(text, session_id)
+            # Get active session
+            session = get_active_session(session_id)
+            if not session:
+                return JSONResponse(
+                    content={"success": False, "error": "No active sessions"},
+                    status_code=404
+                )
             
-            status_code = 200 if result.get("success") else 404
-            return JSONResponse(status_code=status_code, content=result)
+            # Inject the text for TTS
+            await speak_to_session(session, text)
+            
+            return JSONResponse(content={
+                "success": True,
+                "session_id": session["session_id"]
+            })
             
         except Exception as e:
             return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": str(e)}
+                content={"success": False, "error": str(e)},
+                status_code=500
             )
     
     # ========================================================================
-    # /sessions endpoint - Get info about active sessions
+    # /sessions endpoint - Get info about active voice sessions
     # ========================================================================
     @app.get("/sessions")
     async def sessions_endpoint():
@@ -152,7 +101,18 @@ def _patched_create_server_app(**kwargs):
         from sessions import get_session_info
         return JSONResponse(content=get_session_info())
     
-    print("✅ Added /speak and /sessions endpoints")
+    # ========================================================================
+    # /h264 - Custom client with H264 codec preference (better for screen share)
+    # ========================================================================
+    @app.get("/h264")
+    async def h264_client():
+        """Serve custom H264-preferred client for better screen sharing."""
+        client_path = Path(__file__).parent / "static" / "index.html"
+        if client_path.exists():
+            return FileResponse(client_path, media_type="text/html")
+        return JSONResponse(content={"error": "Custom client not found"}, status_code=404)
+    
+    print("✅ Added /speak, /sessions, and /h264 endpoints")
     
     return app
 
@@ -165,6 +125,13 @@ print("⏳ Loading models and imports (may take ~20 seconds on first run)\n")
 
 # Import bot module to register the bot function  
 import bot
+import sys
+
+# Add port from config if not specified
+if '--port' not in sys.argv:
+    port = bot.get_transport_port()
+    sys.argv.extend(['--port', str(port)])
+    print(f"📡 Using port from config: {port}")
 
 # Run the main function
 from pipecat.runner.run import main

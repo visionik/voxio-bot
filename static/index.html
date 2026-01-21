@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxio Bot - H264</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #fff;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        h1 { color: #00d9ff; margin-bottom: 20px; }
+        .container {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .video-box {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 15px;
+            text-align: center;
+        }
+        video {
+            width: 480px;
+            height: 360px;
+            background: #000;
+            border-radius: 8px;
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        button {
+            background: #00d9ff;
+            color: #1a1a2e;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        button:hover { background: #00b8d4; }
+        button:disabled { background: #444; color: #888; cursor: not-allowed; }
+        button.active { background: #00ff88; }
+        #status {
+            margin-top: 15px;
+            padding: 10px;
+            background: #16213e;
+            border-radius: 8px;
+            font-family: monospace;
+            max-width: 600px;
+            word-wrap: break-word;
+        }
+        .codec-info { color: #00ff88; font-size: 12px; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <h1>🐺 Voxio Bot (H264)</h1>
+    <div class="container">
+        <div class="video-box">
+            <h3>Your Video (Input)</h3>
+            <video id="localVideo" autoplay muted playsinline></video>
+            <div class="codec-info" id="codecInfo">Codec: detecting...</div>
+        </div>
+        <div class="video-box">
+            <h3>Vinston (Output)</h3>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+    </div>
+    <div class="controls">
+        <button id="connectBtn">Connect</button>
+        <button id="cameraBtn" disabled>📷 Camera</button>
+        <button id="screenBtn" disabled>🖥️ Screen Share</button>
+        <button id="muteBtn" disabled>🎤 Mute</button>
+    </div>
+    <div id="status">Status: Ready</div>
+
+    <script>
+        let pc = null;
+        let localStream = null;
+        let isMuted = false;
+
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const connectBtn = document.getElementById('connectBtn');
+        const cameraBtn = document.getElementById('cameraBtn');
+        const screenBtn = document.getElementById('screenBtn');
+        const muteBtn = document.getElementById('muteBtn');
+        const status = document.getElementById('status');
+        const codecInfo = document.getElementById('codecInfo');
+
+        function setStatus(msg) {
+            status.textContent = 'Status: ' + msg;
+            console.log(msg);
+        }
+
+        // Set H264 as preferred codec using setCodecPreferences API
+        function preferH264Codec(pc) {
+            const transceivers = pc.getTransceivers();
+            for (const transceiver of transceivers) {
+                if (transceiver.sender && transceiver.sender.track?.kind === 'video') {
+                    const codecs = RTCRtpSender.getCapabilities('video')?.codecs || [];
+                    // Sort to put H264 first
+                    const h264Codecs = codecs.filter(c => c.mimeType === 'video/H264');
+                    const otherCodecs = codecs.filter(c => c.mimeType !== 'video/H264');
+                    const sortedCodecs = [...h264Codecs, ...otherCodecs];
+                    
+                    if (sortedCodecs.length > 0) {
+                        try {
+                            transceiver.setCodecPreferences(sortedCodecs);
+                            console.log('Set H264 as preferred codec');
+                            codecInfo.textContent = 'Codec: H264 preferred';
+                        } catch (e) {
+                            console.warn('Could not set codec preferences:', e);
+                            codecInfo.textContent = 'Codec: browser default';
+                        }
+                    }
+                }
+            }
+        }
+
+        async function connect() {
+            setStatus('Connecting...');
+            
+            try {
+                // Get user media (camera + mic)
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+                localVideo.srcObject = localStream;
+                
+                // Create peer connection
+                pc = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+                
+                // Add local tracks
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                });
+                
+                // Set H264 preference after adding tracks
+                preferH264Codec(pc);
+                
+                // Handle remote tracks
+                pc.ontrack = (event) => {
+                    console.log('Got remote track:', event.track.kind);
+                    if (event.track.kind === 'video') {
+                        remoteVideo.srcObject = event.streams[0];
+                    } else if (event.track.kind === 'audio') {
+                        if (!remoteVideo.srcObject) {
+                            remoteVideo.srcObject = new MediaStream();
+                        }
+                        remoteVideo.srcObject.addTrack(event.track);
+                    }
+                };
+                
+                pc.oniceconnectionstatechange = () => {
+                    setStatus('ICE: ' + pc.iceConnectionState);
+                };
+                
+                // Create offer
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                
+                // Wait for ICE gathering
+                await new Promise(resolve => {
+                    if (pc.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        pc.onicegatheringstatechange = () => {
+                            if (pc.iceGatheringState === 'complete') resolve();
+                        };
+                        // Timeout after 5 seconds
+                        setTimeout(resolve, 5000);
+                    }
+                });
+                
+                // Send offer to server
+                const response = await fetch('/api/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: pc.localDescription.sdp,
+                        type: pc.localDescription.type
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Server returned ' + response.status);
+                }
+                
+                const answer = await response.json();
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                
+                setStatus('Connected!');
+                connectBtn.textContent = 'Disconnect';
+                cameraBtn.disabled = false;
+                screenBtn.disabled = false;
+                muteBtn.disabled = false;
+                
+            } catch (err) {
+                setStatus('Error: ' + err.message);
+                console.error(err);
+            }
+        }
+
+        async function disconnect() {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
+            setStatus('Disconnected');
+            connectBtn.textContent = 'Connect';
+            cameraBtn.disabled = true;
+            screenBtn.disabled = true;
+            muteBtn.disabled = true;
+            codecInfo.textContent = 'Codec: detecting...';
+        }
+
+        async function switchToCamera() {
+            if (!pc) return;
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                const videoTrack = stream.getVideoTracks()[0];
+                const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+                if (sender) {
+                    await sender.replaceTrack(videoTrack);
+                    if (localStream) {
+                        localStream.getVideoTracks().forEach(t => t.stop());
+                    }
+                    localStream = stream;
+                    localVideo.srcObject = stream;
+                    setStatus('Switched to camera');
+                    cameraBtn.classList.add('active');
+                    screenBtn.classList.remove('active');
+                }
+            } catch (err) {
+                setStatus('Camera error: ' + err.message);
+            }
+        }
+
+        async function switchToScreen() {
+            if (!pc) return;
+            try {
+                const stream = await navigator.mediaDevices.getDisplayMedia({ 
+                    video: { 
+                        cursor: 'always'
+                    }
+                });
+                const videoTrack = stream.getVideoTracks()[0];
+                const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+                if (sender) {
+                    await sender.replaceTrack(videoTrack);
+                    if (localStream) {
+                        localStream.getVideoTracks().forEach(t => t.stop());
+                    }
+                    localVideo.srcObject = stream;
+                    setStatus('Switched to screen share');
+                    screenBtn.classList.add('active');
+                    cameraBtn.classList.remove('active');
+                    
+                    // Handle screen share stop
+                    videoTrack.onended = () => switchToCamera();
+                }
+            } catch (err) {
+                setStatus('Screen share error: ' + err.message);
+            }
+        }
+
+        function toggleMute() {
+            if (!localStream) return;
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                isMuted = !isMuted;
+                audioTrack.enabled = !isMuted;
+                muteBtn.textContent = isMuted ? '🔇 Unmute' : '🎤 Mute';
+                muteBtn.classList.toggle('active', isMuted);
+            }
+        }
+
+        connectBtn.onclick = () => pc ? disconnect() : connect();
+        cameraBtn.onclick = switchToCamera;
+        screenBtn.onclick = switchToScreen;
+        muteBtn.onclick = toggleMute;
+    </script>
+</body>
+</html>

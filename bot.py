@@ -8,7 +8,20 @@
 Voxio Bot - Voice & video AI assistant.
 
 Run locally with:
-    uv run python run_auth.py
+    uv run python bot.py
+
+With custom config:
+    uv run python bot.py --config my-config.toml
+
+LLM mode:
+    uv run python bot.py --llm-mode local    # Default: VB's Claude + limited tools + handoff
+    uv run python bot.py --llm-mode gateway  # Full Clawdbot access (all tools, no handoff)
+
+Session targeting (ACP-style):
+    uv run python bot.py --session agent:main:main
+    uv run python bot.py --session-label "voice assistant"
+    uv run python bot.py --require-existing
+    uv run python bot.py --reset-session
 
 Then open http://localhost:8086/client in your browser.
 """
@@ -28,17 +41,80 @@ import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
+# ============================================================================
+# FORCE H264 CODEC (monkey-patch aiortc to prefer H264 over VP8)
+# ============================================================================
+def _patch_aiortc_h264():
+    """Patch aiortc to prefer H264 codec for video (better for screen sharing)."""
+    try:
+        from aiortc import RTCPeerConnection
+        from aiortc.rtcrtpsender import RTCRtpSender
+        
+        _original_addTrack = RTCPeerConnection.addTrack
+        
+        def _patched_addTrack(self, track, *streams):
+            sender = _original_addTrack(self, track, *streams)
+            
+            # Set H264 as preferred codec for video tracks
+            if track.kind == 'video':
+                try:
+                    caps = RTCRtpSender.getCapabilities('video')
+                    if caps and caps.codecs:
+                        # Sort codecs to put H264 first
+                        h264_codecs = [c for c in caps.codecs if 'H264' in c.mimeType]
+                        other_codecs = [c for c in caps.codecs if 'H264' not in c.mimeType]
+                        sorted_codecs = h264_codecs + other_codecs
+                        
+                        # Find and configure the transceiver
+                        for t in self.getTransceivers():
+                            if t.sender == sender:
+                                t.setCodecPreferences(sorted_codecs)
+                                logger.info("🎬 Set H264 as preferred video codec")
+                                break
+                except Exception as e:
+                    logger.warning(f"Could not set H264 preference: {e}")
+            
+            return sender
+        
+        RTCPeerConnection.addTrack = _patched_addTrack
+        logger.info("✅ Patched aiortc to prefer H264 codec")
+    except Exception as e:
+        logger.warning(f"Could not patch aiortc for H264: {e}")
+
+_patch_aiortc_h264()
+
 
 # ============================================================================
 # TOML CONFIGURATION
 # ============================================================================
 
-CONFIG_PATH = Path(__file__).parent / "config.toml"
+def _get_config_path() -> Path:
+    """Get config path from --config CLI arg or default to config.toml."""
+    import sys
+    for i, arg in enumerate(sys.argv):
+        if arg in ('--config', '-c') and i + 1 < len(sys.argv):
+            return Path(sys.argv[i + 1])
+    return Path(__file__).parent / "config.toml"
+
+def _get_cli_arg(names: list, default=None):
+    """Get a CLI argument value by name(s)."""
+    import sys
+    for i, arg in enumerate(sys.argv):
+        if arg in names and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+def _has_cli_flag(names: list) -> bool:
+    """Check if a CLI flag is present."""
+    import sys
+    return any(arg in sys.argv for arg in names)
+
+CONFIG_PATH = _get_config_path()
 _config: dict[str, Any] = {}
 
 
 def load_config() -> dict[str, Any]:
-    """Load configuration from config.toml."""
+    """Load configuration from TOML config file."""
     global _config
     try:
         with open(CONFIG_PATH, "rb") as f:
@@ -96,6 +172,123 @@ from pipecat.runner.utils import create_transport
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.llm_service import LLMService
+from pipecat.frames.frames import TextFrame, LLMFullResponseEndFrame
+
+
+class GatewayLLMService(LLMService):
+    """
+    LLM Service that routes all requests through Clawdbot Gateway.
+    Provides full tool access without handoff - voice becomes a direct interface.
+    """
+    
+    def __init__(self, session_key: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self._session_key = session_key or "agent:main:voice"
+        self._callback_url = "http://localhost:8086/speak"
+        logger.info(f"🌐 GatewayLLMService initialized (session: {self._session_key})")
+    
+    async def process_frame(self, frame, direction):
+        """Process frames - handle LLMContextFrame to trigger gateway."""
+        from pipecat.frames.frames import LLMContextFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        
+        # Handle context frames - this is what triggers the LLM
+        if isinstance(frame, LLMContextFrame):
+            logger.info("🌐 Received LLMContextFrame, processing...")
+            await self._process_context(frame)
+            # Don't call super - we handle this frame ourselves
+            return
+        
+        # Pass other frames through normally
+        await super().process_frame(frame, direction)
+    
+    async def _process_context(self, frame):
+        """Process the conversation context through Clawdbot Gateway."""
+        from pipecat.frames.frames import LLMFullResponseStartFrame
+        
+        await self.push_frame(LLMFullResponseStartFrame())
+        
+        # Get messages from the frame's context or directly from frame
+        context = getattr(frame, 'context', None)
+        if context and hasattr(context, 'get_messages'):
+            messages = context.get_messages()
+        elif hasattr(frame, 'messages'):
+            messages = frame.messages
+        else:
+            messages = []
+        
+        # Find the last user message
+        user_message = None
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Handle multi-part content (text + images)
+                    text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+                    content = " ".join(text_parts)
+                user_message = content
+                break
+        
+        if not user_message:
+            logger.warning("🌐 No user message found in context")
+            await self.push_frame(LLMFullResponseEndFrame())
+            return
+        
+        logger.info(f"🌐 Gateway request: {user_message[:100]}...")
+        
+        # Direct response mode - no callback, speak the response directly
+        full_message = f"[Voice Task - respond concisely in 1-2 sentences] {user_message}"
+        
+        # Start ambient sounds while waiting for gateway
+        await audio_manager.start_ambient()
+        
+        try:
+            # Call clawdbot agent with the session
+            proc = await asyncio.create_subprocess_exec(
+                "clawdbot", "agent",
+                "--session-id", self._session_key,
+                "--message", full_message,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            
+            await audio_manager.stop_ambient()
+            
+            if proc.returncode == 0:
+                response = stdout.decode().strip()
+                logger.info(f"🌐 Gateway raw response: {response[:300]}...")
+                
+                # Extract text from /speak tool call if present
+                # Look for: "text": "actual response"
+                import re
+                match = re.search(r'"text"\s*:\s*"([^"]+)"', response)
+                if match:
+                    speak_text = match.group(1)
+                    # Unescape JSON
+                    speak_text = speak_text.replace('\\n', '\n').replace('\\"', '"')
+                    logger.info(f"🌐 Extracted speak text: {speak_text[:100]}...")
+                    await self.push_frame(TextFrame(speak_text))
+                elif response and not response.startswith('exec:'):
+                    await self.push_frame(TextFrame(response))
+                else:
+                    await self.push_frame(TextFrame("I processed your request."))
+            else:
+                error = stderr.decode().strip()
+                logger.error(f"🌐 Gateway error: {error}")
+                await self.push_frame(TextFrame("I had trouble reaching my backend. Please try again."))
+                
+        except asyncio.TimeoutError:
+            await audio_manager.stop_ambient()
+            logger.error("🌐 Gateway timeout")
+            await self.push_frame(TextFrame("The request timed out. Please try again."))
+        except Exception as e:
+            await audio_manager.stop_ambient()
+            logger.error(f"🌐 Gateway exception: {e}")
+            await self.push_frame(TextFrame("Something went wrong. Please try again."))
+        finally:
+            await self.push_frame(LLMFullResponseEndFrame())
 
 # Conditional imports for local Whisper
 try:
@@ -104,6 +297,58 @@ try:
 except ImportError:
     WHISPER_AVAILABLE = False
     logger.warning("Local Whisper not available. Install with: uv add pipecat-ai[whisper] or pipecat-ai[mlx-whisper]")
+
+# Conditional imports for local Moondream vision
+MOONDREAM_AVAILABLE = False
+_moondream_model = None
+_moondream_device = None
+
+def _load_moondream_model():
+    """Load Moondream model. Called at startup if vision.mode = 'local'."""
+    global _moondream_model, _moondream_device, MOONDREAM_AVAILABLE
+    
+    if _moondream_model is not None:
+        return _moondream_model
+    
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM
+        
+        # Detect best device
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            dtype = torch.float16
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+            dtype = torch.float16
+        else:
+            device = torch.device("cpu")
+            dtype = torch.float32
+        
+        logger.info(f"🌙 Loading Moondream model on {device}...")
+        
+        _moondream_model = AutoModelForCausalLM.from_pretrained(
+            "vikhyatk/moondream2",
+            trust_remote_code=True,
+            revision="2025-01-09",
+            device_map={"": device},
+            dtype=dtype,
+        ).eval()
+        
+        _moondream_device = device
+        MOONDREAM_AVAILABLE = True
+        logger.info("✅ Moondream model loaded")
+        return _moondream_model
+        
+    except Exception as e:
+        logger.error(f"Failed to load Moondream: {e}")
+        return None
+
+def _get_moondream_model():
+    """Get loaded Moondream model (or load if not yet loaded)."""
+    if _moondream_model is None:
+        return _load_moondream_model()
+    return _moondream_model
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 
@@ -114,6 +359,49 @@ load_dotenv(override=True)
 # ============================================================================
 # CONFIGURATION (from config.toml, with .env fallback for secrets)
 # ============================================================================
+
+# LLM configuration
+def get_llm_mode():
+    """Get LLM mode: 'local' or 'gateway' (--llm-mode)."""
+    cli_val = _get_cli_arg(['--llm-mode'])
+    return cli_val if cli_val else get_config("llm.mode", "local")
+
+
+# Session configuration (ACP-style options - CLI overrides config)
+def get_session_key():
+    """Get session key for Clawdbot handoffs (--session <key>)."""
+    cli_val = _get_cli_arg(['--session', '-s'])
+    return cli_val if cli_val else get_config("session.key", None)
+
+def get_session_label():
+    """Get session label to resolve (--session-label <label>)."""
+    cli_val = _get_cli_arg(['--session-label'])
+    return cli_val if cli_val else get_config("session.label", None)
+
+def get_session_require_existing():
+    """Whether to require session to already exist (--require-existing)."""
+    if _has_cli_flag(['--require-existing']):
+        return True
+    return get_config("session.require_existing", False)
+
+def get_session_reset_on_connect():
+    """Whether to reset session on connect (--reset-session)."""
+    if _has_cli_flag(['--reset-session']):
+        return True
+    return get_config("session.reset_on_connect", False)
+
+
+def get_identity_name():
+    """Get bot identity name from config."""
+    return get_config("identity.name", "Vinston Wolf")
+
+def get_random_greeting():
+    """Get a random greeting from the config list."""
+    import random
+    greetings = get_config("identity.greetings", ["Vinston here. What needs fixing?"])
+    if isinstance(greetings, list) and greetings:
+        return random.choice(greetings)
+    return greetings if greetings else "Hello!"
 
 def get_stt_provider():
     return get_config("stt.provider", os.getenv("STT_PROVIDER", "openai")).lower()
@@ -140,8 +428,37 @@ def get_default_avatar_path():
     return get_config("video.avatar", os.getenv("DEFAULT_AVATAR_PATH", "avatar.png"))
 
 def get_image_display_duration():
-    """Get how long to display generated images before returning to avatar."""
+    """Get how long to display generated images before returning to avatar (5 min default)."""
     return get_config("video.image_display_duration", 300)
+
+def get_capture_display_duration():
+    """Get how long to display captured frames before returning to avatar (60s default)."""
+    return get_config("video.capture_display_duration", 60)
+
+def get_gif_display_duration():
+    """Get how long to display GIFs before returning to avatar (2 min default)."""
+    return get_config("video.gif_display_duration", 120)
+
+async def cancel_current_display():
+    """Cancel any current image display and return to avatar."""
+    global _avatar_return_task, _gif_animation_task, _image_display_until
+    
+    # Cancel avatar return timer
+    if _avatar_return_task and not _avatar_return_task.done():
+        _avatar_return_task.cancel()
+        logger.info("🖼️ Cancelled avatar return timer")
+    
+    # Cancel GIF animation
+    if _gif_animation_task and not _gif_animation_task.done():
+        _gif_animation_task.cancel()
+        logger.info("🖼️ Cancelled GIF animation")
+    
+    # Reset display timer
+    _image_display_until = 0
+    
+    # Return to avatar
+    await send_default_avatar()
+    logger.info("🖼️ Returned to avatar for new image")
 
 def get_vision_mode():
     """Get vision analysis mode: handoff, direct, or local."""
@@ -170,6 +487,11 @@ TTS_MODEL_PATH = get_tts_model_path()
 VIDEO_IN_ENABLED = get_video_in_enabled()
 VIDEO_OUT_ENABLED = get_video_out_enabled()
 DEFAULT_AVATAR_PATH = get_default_avatar_path()
+
+# Eager-load Moondream if vision mode is "local"
+if get_vision_mode() == "local":
+    logger.info("🔭 Vision mode is 'local' - loading Moondream at startup...")
+    _load_moondream_model()
 
 # Nano-banana path for image generation
 NANO_BANANA_SCRIPT = "/opt/homebrew/lib/node_modules/clawdbot/skills/nano-banana-pro/scripts/generate_image.py"
@@ -302,10 +624,9 @@ def _patched_create_server_app(**kwargs):
                     status_code=400
                 )
             
-            # Stop ambient sounds before speaking (interrupt them)
-            if is_ambient_sounds_playing():
-                stop_ambient_sounds()
-                logger.info("🔇 /speak: Stopped ambient sounds")
+            # Interrupt all audio before speaking (stop ambient + current TTS)
+            await audio_manager.interrupt_all()
+            logger.info("🔇 /speak: Audio interrupted for injection")
             
             from sessions import speak_to_session
             result = await speak_to_session(text, session_id)
@@ -423,7 +744,7 @@ _ambient_sound_task: Optional[asyncio.Task] = None
 _ambient_sounds_playing: bool = False
 
 
-def stop_ambient_sounds():
+def stop_ambient_sounds():  # Legacy - use audio_manager.stop_ambient()
     """Stop the ambient sound loop if running and interrupt audio playback."""
     global _ambient_sound_task, _ambient_sounds_playing, _current_task
     
@@ -448,9 +769,8 @@ async def _send_interruption_frame():
     global _current_task
     if _current_task:
         from pipecat.frames.frames import InterruptionTaskFrame
-        from pipecat.processors.frame_processor import FrameDirection
-        # Push upstream to trigger interruption
-        await _current_task.queue_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
+        # Push frame (Pipecat 0.0.99 API - no direction argument)
+        await _current_task.queue_frame(InterruptionTaskFrame())
         logger.info("🔇 Sent InterruptionTaskFrame to stop audio")
 
 
@@ -615,7 +935,7 @@ async def play_handoff_sound():
             
     elif sound_type == "ambient":
         # Start the ambient sound loop
-        start_ambient_sounds()
+        asyncio.create_task(audio_manager.start_ambient())
         
     else:
         logger.warning(f"Unknown handoff sound type: {sound_type}")
@@ -641,11 +961,28 @@ async def handoff_to_clawdbot(params) -> dict:
     full_message = f"[Voice Task] {task}\n\n{callback_info}"
     
     try:
-        # Run clawdbot wake command
-        logger.info(f"🤖 Handing off to Clawdbot: {task[:100]}...")
+        # Build clawdbot command with session options
+        session_key = get_session_key()
+        session_label = get_session_label()
+        
+        # Log session targeting
+        if session_key:
+            logger.info(f"🎯 Session key: {session_key}")
+        if session_label:
+            logger.info(f"🏷️ Session label: {session_label}")
+        
+        # Use 'agent' command if session targeting is configured, else 'wake'
+        if session_key:
+            # Use agent command with explicit session
+            cmd = ["clawdbot", "agent", "--session-id", session_key, "--message", full_message]
+            logger.info(f"🤖 Handing off to Clawdbot (session: {session_key}): {task[:100]}...")
+        else:
+            # Default: use wake command (routes to main session)
+            cmd = ["clawdbot", "wake", "--mode", "now", "--text", full_message]
+            logger.info(f"🤖 Handing off to Clawdbot: {task[:100]}...")
         
         result = subprocess.run(
-            ["clawdbot", "wake", "--mode", "now", "--text", full_message],
+            cmd,
             capture_output=True,
             text=True,
             timeout=10,
@@ -653,9 +990,9 @@ async def handoff_to_clawdbot(params) -> dict:
         
         if result.returncode == 0:
             logger.info("✅ Clawdbot wake successful")
-            # Speak acknowledgment first, then play typing sound
-            await speak_then_play_handoff_sound()
-            # Return empty message since we already spoke
+            # Start ambient sounds directly (no spoken acknowledgment)
+            await audio_manager.start_ambient()
+            # Return empty message - Clawdbot will respond via /speak
             return {"status": "success", "message": ""}
         else:
             logger.error(f"Clawdbot wake failed: {result.stderr}")
@@ -755,6 +1092,377 @@ async def play_sound_effect(params) -> dict:
 # VIDEO/IMAGE TOOLS
 # ============================================================================
 
+from enum import Enum, auto
+
+class DisplayState(Enum):
+    """States for the video output display."""
+    AVATAR = auto()     # Showing default avatar
+    CAPTURE = auto()    # Showing captured camera frame
+    GIF = auto()        # Animating a GIF
+    IMAGE = auto()      # Showing generated image
+
+
+class DisplayManager:
+    """
+    State machine for managing video output display.
+    
+    Handles transitions between avatar, captured frames, GIFs, and generated images.
+    Ensures clean cancellation of timers and animations when switching.
+    """
+    
+    def __init__(self):
+        self.state = DisplayState.AVATAR
+        self._return_task: Optional[asyncio.Task] = None
+        self._animation_task: Optional[asyncio.Task] = None
+        self._task: Optional["PipelineTask"] = None  # Reference to Pipecat task
+        
+    def set_task(self, task):
+        """Set the Pipecat task reference for sending frames."""
+        self._task = task
+        
+    async def _cancel_current(self):
+        """Cancel any running timers or animations."""
+        if self._return_task and not self._return_task.done():
+            self._return_task.cancel()
+            try:
+                await self._return_task
+            except asyncio.CancelledError:
+                pass
+            self._return_task = None
+            
+        if self._animation_task and not self._animation_task.done():
+            self._animation_task.cancel()
+            try:
+                await self._animation_task
+            except asyncio.CancelledError:
+                pass
+            self._animation_task = None
+    
+    async def _send_frame(self, image_bytes: bytes, size: tuple, format: str = "RGB"):
+        """Send a frame to video output."""
+        if not self._task:
+            logger.warning("DisplayManager: No task set, cannot send frame")
+            return False
+        try:
+            from pipecat.frames.frames import OutputImageRawFrame
+            frame = OutputImageRawFrame(image=image_bytes, size=size, format=format)
+            await self._task.queue_frame(frame)
+            return True
+        except Exception as e:
+            logger.error(f"DisplayManager: Failed to send frame: {e}")
+            return False
+    
+    async def _send_avatar(self):
+        """Send the default avatar."""
+        avatar_path = get_default_avatar_path()
+        if not os.path.exists(avatar_path):
+            logger.warning(f"DisplayManager: Avatar not found: {avatar_path}")
+            return
+        try:
+            from PIL import Image
+            with Image.open(avatar_path) as img:
+                img_rgb = img.convert('RGB')
+                await self._send_frame(img_rgb.tobytes(), img_rgb.size, "RGB")
+            logger.info("🐺 DisplayManager: Sent avatar")
+        except Exception as e:
+            logger.error(f"DisplayManager: Failed to send avatar: {e}")
+    
+    async def _schedule_return(self, duration: int):
+        """Schedule return to avatar after duration seconds."""
+        async def return_to_avatar():
+            await asyncio.sleep(duration)
+            await self.show_avatar()
+        
+        self._return_task = asyncio.create_task(return_to_avatar())
+    
+    async def show_avatar(self):
+        """Transition to AVATAR state."""
+        import traceback
+        caller = ''.join(traceback.format_stack()[-3:-1])
+        logger.info(f"🖼️ DisplayManager: show_avatar() called from:\n{caller}")
+        await self._cancel_current()
+        self.state = DisplayState.AVATAR
+        await self._send_avatar()
+        logger.info("🖼️ DisplayManager: State -> AVATAR")
+    
+    async def show_capture(self, frame_bytes: bytes):
+        """Show a captured camera frame."""
+        await self._cancel_current()
+        await self._send_avatar()  # Brief avatar while preparing
+        
+        try:
+            from PIL import Image
+            import io
+            with Image.open(io.BytesIO(frame_bytes)) as img:
+                img_rgb = img.convert('RGB')
+                await self._send_frame(img_rgb.tobytes(), img_rgb.size, "RGB")
+            
+            self.state = DisplayState.CAPTURE
+            duration = get_capture_display_duration()
+            await self._schedule_return(duration)
+            logger.info(f"🖼️ DisplayManager: State -> CAPTURE ({duration}s)")
+        except Exception as e:
+            logger.error(f"DisplayManager: Failed to show capture: {e}")
+            await self._send_avatar()
+    
+    async def show_image(self, image_path: str):
+        """Show a generated image."""
+        await self._cancel_current()
+        await self._send_avatar()  # Brief avatar while preparing
+        
+        try:
+            from PIL import Image
+            with Image.open(image_path) as img:
+                img_rgb = img.convert('RGB')
+                await self._send_frame(img_rgb.tobytes(), img_rgb.size, "RGB")
+            
+            self.state = DisplayState.IMAGE
+            duration = get_image_display_duration()
+            await self._schedule_return(duration)
+            logger.info(f"🖼️ DisplayManager: State -> IMAGE ({duration}s)")
+        except Exception as e:
+            logger.error(f"DisplayManager: Failed to show image: {e}")
+            await self._send_avatar()
+    
+    async def show_gif(self, frames: list, durations: list):
+        """Animate a GIF."""
+        await self._cancel_current()
+        await self._send_avatar()  # Brief avatar while preparing
+        
+        self.state = DisplayState.GIF
+        duration = get_gif_display_duration()
+        
+        async def animate():
+            try:
+                end_time = asyncio.get_event_loop().time() + duration
+                frame_idx = 0
+                
+                while asyncio.get_event_loop().time() < end_time:
+                    frame = frames[frame_idx % len(frames)]
+                    frame_duration = durations[frame_idx % len(durations)]
+                    
+                    await self._send_frame(frame.tobytes(), frame.size, "RGB")
+                    await asyncio.sleep(frame_duration)
+                    frame_idx += 1
+                
+                logger.info("🎬 DisplayManager: GIF animation complete")
+            except asyncio.CancelledError:
+                logger.info("🎬 DisplayManager: GIF animation cancelled")
+            finally:
+                await self.show_avatar()
+        
+        self._animation_task = asyncio.create_task(animate())
+        logger.info(f"🖼️ DisplayManager: State -> GIF ({duration}s, {len(frames)} frames)")
+
+
+# Global display manager instance
+display_manager = DisplayManager()
+
+
+class AudioState(Enum):
+    """States for audio output management."""
+    IDLE = auto()       # Nothing playing
+    TTS = auto()        # LLM speaking (interruptible)
+    AMBIENT = auto()    # Background sounds (while waiting)
+    INJECTED = auto()   # External /speak TTS
+    SFX = auto()        # Sound effect (short, overlays)
+
+
+class AudioManager:
+    """
+    State machine for managing audio output.
+    
+    Handles TTS, ambient sounds, /speak injection, and sound effects.
+    Ensures proper interruption and state transitions.
+    """
+    
+    def __init__(self):
+        self.state = AudioState.IDLE
+        self._task: Optional["PipelineTask"] = None
+        self._ambient_task: Optional[asyncio.Task] = None
+        self._tts_service = None  # Reference to TTS service
+        self._last_ambient_file: Optional[str] = None  # Track last played to avoid repeats
+        
+    def set_task(self, task):
+        """Set the Pipecat task reference."""
+        self._task = task
+        
+    def set_tts(self, tts):
+        """Set the TTS service reference."""
+        self._tts_service = tts
+    
+    async def _send_interruption(self):
+        """Send interruption frame to stop current audio."""
+        if self._task:
+            try:
+                from pipecat.frames.frames import InterruptionTaskFrame
+                await self._task.queue_frame(InterruptionTaskFrame())
+                logger.debug("🔇 AudioManager: Sent interruption frame")
+            except Exception as e:
+                logger.warning(f"AudioManager: Could not send interruption: {e}")
+    
+    async def _cancel_ambient(self):
+        """Cancel ambient sound loop if running."""
+        if self._ambient_task and not self._ambient_task.done():
+            self._ambient_task.cancel()
+            try:
+                await self._ambient_task
+            except asyncio.CancelledError:
+                pass
+            self._ambient_task = None
+            logger.info("🔇 AudioManager: Ambient sounds cancelled")
+    
+    async def interrupt_all(self):
+        """Stop all audio (called on user speech)."""
+        await self._cancel_ambient()
+        await self._send_interruption()
+        self.state = AudioState.IDLE
+        logger.info("🔇 AudioManager: All audio interrupted -> IDLE")
+    
+    async def start_ambient(self):
+        """Start ambient background sounds."""
+        # Cancel any existing ambient
+        await self._cancel_ambient()
+        
+        # Don't start if already doing TTS
+        if self.state == AudioState.TTS:
+            logger.debug("AudioManager: Skipping ambient, TTS in progress")
+            return
+        
+        self.state = AudioState.AMBIENT
+        
+        async def ambient_loop():
+            """Loop playing random ambient sounds."""
+            import random
+            files = get_handoff_files()
+            gap = get_handoff_gap()
+            
+            logger.info(f"🎵 AudioManager: Starting ambient ({len(files)} files)")
+            
+            try:
+                while self.state == AudioState.AMBIENT:
+                    if not files:
+                        await asyncio.sleep(0.5)
+                        continue
+                    
+                    # Pick random file, avoiding last played (if more than 1 file)
+                    available = [f for f in files if f != self._last_ambient_file] if len(files) > 1 else files
+                    sound_file = random.choice(available)
+                    self._last_ambient_file = sound_file
+                    
+                    duration = await self._play_sound(sound_file)
+                    
+                    if duration > 0:
+                        await asyncio.sleep(duration + gap)
+                    else:
+                        await asyncio.sleep(0.5)
+                        
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if self.state == AudioState.AMBIENT:
+                    self.state = AudioState.IDLE
+        
+        self._ambient_task = asyncio.create_task(ambient_loop())
+        logger.info("🎵 AudioManager: State -> AMBIENT")
+    
+    async def stop_ambient(self):
+        """Stop ambient sounds."""
+        if self.state == AudioState.AMBIENT:
+            await self._cancel_ambient()
+            self.state = AudioState.IDLE
+            logger.info("🔇 AudioManager: State -> IDLE (ambient stopped)")
+    
+    def on_tts_start(self):
+        """Called when TTS starts speaking (auto-stops ambient)."""
+        if self.state == AudioState.AMBIENT:
+            # Cancel ambient synchronously, TTS takes over
+            if self._ambient_task and not self._ambient_task.done():
+                self._ambient_task.cancel()
+                self._ambient_task = None
+        self.state = AudioState.TTS
+        logger.debug("🎤 AudioManager: State -> TTS")
+    
+    def on_tts_end(self):
+        """Called when TTS finishes speaking."""
+        if self.state == AudioState.TTS:
+            self.state = AudioState.IDLE
+            logger.debug("🎤 AudioManager: State -> IDLE (TTS done)")
+    
+    async def speak_injected(self, text: str) -> bool:
+        """Speak text via /speak endpoint (external injection)."""
+        if not self._tts_service or not self._task:
+            logger.warning("AudioManager: No TTS service or task for injection")
+            return False
+        
+        # Stop ambient if playing
+        await self._cancel_ambient()
+        await self._send_interruption()
+        
+        self.state = AudioState.INJECTED
+        logger.info(f"💉 AudioManager: Injecting speech: {text[:50]}...")
+        
+        try:
+            from pipecat.frames.frames import TextFrame, EndFrame
+            # Queue text for TTS
+            await self._task.queue_frame(TextFrame(text))
+            self.state = AudioState.IDLE
+            return True
+        except Exception as e:
+            logger.error(f"AudioManager: Injection failed: {e}")
+            self.state = AudioState.IDLE
+            return False
+    
+    async def play_sfx(self, sound_file: str):
+        """Play a sound effect (short, can overlay other audio)."""
+        # SFX doesn't change state - it overlays
+        previous_state = self.state
+        logger.info(f"🔊 AudioManager: Playing SFX: {sound_file}")
+        await self._play_sound(sound_file)
+        # State unchanged - SFX is fire-and-forget
+    
+    async def _play_sound(self, sound_file: str) -> float:
+        """Play a sound file, return duration in seconds."""
+        if not self._task:
+            return 0
+        
+        from pipecat.frames.frames import OutputAudioRawFrame
+        import wave
+        
+        file_path = os.path.join(os.path.dirname(__file__), sound_file)
+        
+        if not os.path.exists(file_path):
+            logger.warning(f"AudioManager: Sound not found: {file_path}")
+            return 0
+        
+        try:
+            with wave.open(file_path, 'rb') as wav:
+                sample_rate = wav.getframerate()
+                n_frames = wav.getnframes()
+                duration = n_frames / sample_rate
+            
+            with open(file_path, 'rb') as f:
+                wav_data = f.read()
+                audio_data = wav_data[44:]  # Skip WAV header
+            
+            frame = OutputAudioRawFrame(
+                audio=audio_data,
+                sample_rate=sample_rate,
+                num_channels=1
+            )
+            await self._task.queue_frame(frame)
+            logger.debug(f"🔊 AudioManager: Played {os.path.basename(sound_file)} ({duration:.1f}s)")
+            
+            return duration
+            
+        except Exception as e:
+            logger.warning(f"AudioManager: Could not play {sound_file}: {e}")
+            return 0
+
+
+# Global audio manager instance
+audio_manager = AudioManager()
+
 # Store for captured video frames
 _last_video_frame: Optional[bytes] = None
 
@@ -790,14 +1498,38 @@ _image_display_until: float = 0  # Timestamp when to return to avatar
 _has_greeted: bool = False  # Prevent duplicate greetings
 
 
-async def send_default_avatar():
-    """Send the default Vinston avatar image to video output."""
-    global _current_task, _image_display_until
+async def _display_captured_frame(frame_bytes: bytes):
+    """Display the captured video frame as output (show user what we're analyzing)."""
+    global _current_task
     
-    # Don't send avatar if we're still displaying a generated image
-    import time
-    if time.time() < _image_display_until:
+    if not _current_task:
         return
+    
+    try:
+        from pipecat.frames.frames import OutputImageRawFrame
+        from PIL import Image
+        import io
+        
+        # Load the JPEG frame and convert to RGB
+        with Image.open(io.BytesIO(frame_bytes)) as img:
+            img_rgb = img.convert('RGB')
+            width, height = img_rgb.size
+            raw_bytes = img_rgb.tobytes()
+        
+        frame = OutputImageRawFrame(
+            image=raw_bytes,
+            size=(width, height),
+            format="RGB"
+        )
+        await _current_task.queue_frame(frame)
+        logger.info(f"📸 Displayed captured frame: {width}x{height}")
+    except Exception as e:
+        logger.error(f"Failed to display captured frame: {e}")
+
+
+async def send_default_avatar():
+    """Send the default Vinston avatar image to video output (legacy, use display_manager)."""
+    global _current_task
     
     if not _current_task or not os.path.exists(DEFAULT_AVATAR_PATH):
         return
@@ -837,9 +1569,10 @@ async def schedule_avatar_return(delay_seconds: int = 60):
         logger.info("🖼️ Avatar return cancelled (new image displayed)")
 
 
-async def analyze_video_frame(params) -> dict:
+async def _analyze_video_frame_impl(params) -> dict:
+    global _avatar_return_task
     """
-    Capture and analyze the current video frame.
+    Internal implementation - capture and analyze the current video frame.
     
     Mode is controlled by vision.mode in config.toml:
     - handoff: send to Clawdbot for analysis (default)
@@ -849,7 +1582,7 @@ async def analyze_video_frame(params) -> dict:
     global _last_video_frame
     
     if not _last_video_frame:
-        return {"status": "error", "message": "No video frame available. Is the camera on?"}
+        return "No video frame available. Is the camera on?"
     
     vision_mode = get_vision_mode()
     logger.info(f"📸 Analyzing video frame (mode: {vision_mode})")
@@ -897,20 +1630,40 @@ async def analyze_video_frame(params) -> dict:
         elif vision_mode == "local":
             # Use local vision model
             local_model = get_vision_local_model()
-            description = await _analyze_with_local_model(frame_path, local_model)
             
-            return {
-                "status": "success",
-                "mode": "local",
-                "model": local_model,
-                "description": description
-            }
+            # 1. Display the captured frame via DisplayManager
+            await display_manager.show_capture(_last_video_frame)
+            
+            # 2. Start ambient sounds while processing
+            await audio_manager.start_ambient()
+            
+            try:
+                # 3. Run vision analysis
+                description = await _analyze_with_local_model(frame_path, local_model)
+            finally:
+                # 4. Stop ambient sounds when done (success or error)
+                await audio_manager.stop_ambient()
+            
+            # Return description as string - Pipecat passes this directly to LLM
+            logger.info(f"📸 Local vision result: {description[:200] if description else 'None'}...")
+            return f"[Vision Analysis]: {description}"
         else:
-            return {"status": "error", "message": f"Unknown vision mode: {vision_mode}"}
+            return f"Error: Unknown vision mode: {vision_mode}"
             
     except Exception as e:
         logger.error(f"Video frame analysis error: {e}")
-        return {"status": "error", "message": str(e)}
+        return f"Error analyzing video frame: {str(e)}"
+
+
+async def analyze_video_frame(params):
+    """
+    Capture and analyze the current video frame.
+    Uses params.result_callback to return result to Pipecat LLM.
+    """
+    result = await _analyze_video_frame_impl(params)
+    logger.info(f"📸 analyze_video_frame result: {str(result)[:200]}...")
+    # Must use callback to pass result back to LLM!
+    await params.result_callback(result)
 
 
 async def _analyze_with_local_model(frame_path: str, model_name: str) -> str:
@@ -919,20 +1672,26 @@ async def _analyze_with_local_model(frame_path: str, model_name: str) -> str:
     
     try:
         if model_name == "moondream":
-            # Moondream via CLI or Python API
-            result = subprocess.run(
-                ["moondream", "--image", frame_path, "--prompt", "Describe this image in detail."],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-            else:
-                return f"Moondream error: {result.stderr}"
+            # Use Moondream via transformers (lazy-loaded)
+            model = _get_moondream_model()
+            if model is None:
+                return "Moondream model not available. Install with: uv add pipecat-ai[moondream]"
+            
+            from PIL import Image
+            
+            def run_moondream():
+                image = Image.open(frame_path)
+                image_embeds = model.encode_image(image)
+                result = model.query(image_embeds, "Describe this image in detail.")
+                return result.get("answer", str(result))
+            
+            # Run in thread to avoid blocking
+            description = await asyncio.to_thread(run_moondream)
+            logger.info(f"🌙 Moondream result: {description[:200] if description else 'None'}...")
+            return description
                 
         elif model_name == "llava":
-            # LLaVA via llama.cpp or ollama
+            # LLaVA via ollama
             result = subprocess.run(
                 ["ollama", "run", "llava", f"Describe this image: {frame_path}"],
                 capture_output=True,
@@ -956,6 +1715,7 @@ async def _analyze_with_local_model(frame_path: str, model_name: str) -> str:
     except FileNotFoundError:
         return f"Local model '{model_name}' not installed or not in PATH"
     except Exception as e:
+        logger.error(f"Local vision error: {e}")
         return f"Local vision error: {e}"
 
 
@@ -964,19 +1724,16 @@ async def show_generated_image(params) -> dict:
     Generate and display an image relevant to the conversation.
     Uses nano-banana (Gemini) to create the image.
     """
-    global _current_display_image, _gif_animation_task
+    global _current_display_image
     
-    # Cancel any running GIF animation first
-    if _gif_animation_task and not _gif_animation_task.done():
-        _gif_animation_task.cancel()
-        logger.info("🖼️ Cancelled GIF animation for new image")
+    # Cancel current display and show avatar while generating
+    await display_manager.show_avatar()
     
     prompt = params.arguments.get("prompt", "")
     if not prompt:
         return {"status": "error", "message": "No image prompt provided"}
     
     try:
-        import tempfile
         import time
         
         # Generate filename with timestamp
@@ -985,76 +1742,39 @@ async def show_generated_image(params) -> dict:
         
         logger.info(f"🎨 Generating image: {prompt[:50]}...")
         
-        # Call nano-banana script
-        result = subprocess.run(
-            ["uv", "run", NANO_BANANA_SCRIPT, 
-             "--prompt", prompt, 
-             "--filename", filename,
-             "--resolution", "1K"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env={**os.environ, "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "")}
-        )
+        # Start ambient sounds while generating
+        await audio_manager.start_ambient()
+        
+        try:
+            # Call nano-banana script using async subprocess (non-blocking)
+            proc = await asyncio.create_subprocess_exec(
+                "uv", "run", NANO_BANANA_SCRIPT,
+                "--prompt", prompt,
+                "--filename", filename,
+                "--resolution", "1K",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "")}
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            
+            # Create a result-like object for compatibility
+            class Result:
+                def __init__(self, returncode, stdout, stderr):
+                    self.returncode = returncode
+                    self.stdout = stdout.decode() if stdout else ""
+                    self.stderr = stderr.decode() if stderr else ""
+            result = Result(proc.returncode, stdout, stderr)
+        finally:
+            # Stop ambient sounds when done
+            await audio_manager.stop_ambient()
         
         if result.returncode == 0 and os.path.exists(filename):
             _current_display_image = filename
             logger.info(f"✅ Image generated: {filename}")
             
-            # Queue image to video output if we have a task
-            if _current_task:
-                try:
-                    from pipecat.frames.frames import OutputImageRawFrame
-                    from PIL import Image
-                    import time
-                    
-                    global _image_display_until
-                    
-                    # Small delay to let any pending operations complete
-                    await asyncio.sleep(0.1)
-                    
-                    # Load and convert image to raw RGB bytes
-                    with Image.open(filename) as img:
-                        img_rgb = img.convert('RGB')
-                        width, height = img_rgb.size
-                        raw_bytes = img_rgb.tobytes()
-                    
-                    # Check task is still valid
-                    if not _current_task:
-                        logger.warning("Task became None before queuing image")
-                        return {"status": "success", "message": f"Image generated but session ended: {prompt[:30]}..."}
-                    
-                    # Send image frame to video output
-                    frame = OutputImageRawFrame(
-                        image=raw_bytes,
-                        size=(width, height),
-                        format="RGB"
-                    )
-                    await _current_task.queue_frame(frame)
-                    logger.info(f"📺 Image queued to video output: {width}x{height}")
-                    
-                    # Set timer to keep image up for configured duration
-                    display_duration = get_image_display_duration()
-                    _image_display_until = time.time() + display_duration
-                    
-                    # Cancel any existing avatar return task and schedule new one
-                    global _avatar_return_task
-                    if _avatar_return_task and not _avatar_return_task.done():
-                        _avatar_return_task.cancel()
-                        logger.info("🖼️ Cancelled previous avatar return timer")
-                    
-                    try:
-                        _avatar_return_task = asyncio.create_task(schedule_avatar_return(display_duration))
-                        logger.info(f"🖼️ Image will display for {display_duration} seconds")
-                    except Exception as e:
-                        logger.warning(f"Could not schedule avatar return: {e}")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to queue image to video: {e}")
-                    # Don't fail the whole function - image was still generated
-            else:
-                logger.info(f"📺 Image generated (no active task): {filename}")
-                
+            # Display via DisplayManager
+            await display_manager.show_image(filename)
             return {"status": "success", "message": f"Image displayed: {prompt[:30]}..."}
         else:
             logger.error(f"Image generation failed: {result.stderr}")
@@ -1079,15 +1799,15 @@ async def display_gif(params) -> dict:
     Search for and display an animated GIF.
     Uses gifgrep to search Tenor/Giphy, downloads the GIF, and animates it.
     """
-    global _current_task, _gif_animation_task, _avatar_return_task, _image_display_until
-    
     query = params.arguments.get("query", "")
     if not query:
         return {"status": "error", "message": "No search query provided"}
     
+    # Cancel current display and show avatar while searching
+    await display_manager.show_avatar()
+    
     try:
         import tempfile
-        import time
         from PIL import Image
         
         logger.info(f"🎬 Searching for GIF: {query}")
@@ -1147,68 +1867,8 @@ async def display_gif(params) -> dict:
             if not frames:
                 return {"status": "error", "message": "Could not decode GIF frames"}
             
-            # Cancel any existing avatar return task
-            if _avatar_return_task and not _avatar_return_task.done():
-                _avatar_return_task.cancel()
-            
-            # Cancel any existing GIF animation
-            if _gif_animation_task and not _gif_animation_task.done():
-                _gif_animation_task.cancel()
-            
-            # Start GIF animation task
-            display_duration = get_image_display_duration()
-            _image_display_until = time.time() + display_duration
-            
-            async def animate_gif():
-                """Loop through GIF frames."""
-                from pipecat.frames.frames import OutputImageRawFrame
-                
-                logger.info(f"🎬 Starting GIF animation: {len(frames)} frames, {display_duration}s duration")
-                
-                try:
-                    end_time = time.time() + display_duration
-                    frame_idx = 0
-                    
-                    while time.time() < end_time:
-                        if not _current_task:
-                            logger.warning("🎬 No current task, stopping animation")
-                            break
-                        
-                        frame = frames[frame_idx % len(frames)]
-                        duration = durations[frame_idx % len(durations)]
-                        
-                        # Send frame
-                        try:
-                            output_frame = OutputImageRawFrame(
-                                image=frame.tobytes(),
-                                size=frame.size,
-                                format="RGB"
-                            )
-                            await _current_task.queue_frame(output_frame)
-                        except Exception as e:
-                            logger.error(f"🎬 Failed to send frame {frame_idx}: {e}")
-                            break
-                        
-                        await asyncio.sleep(duration)
-                        frame_idx += 1
-                        
-                        # Log progress every 10 frames
-                        if frame_idx % 10 == 0:
-                            logger.debug(f"🎬 Animation progress: frame {frame_idx}")
-                    
-                    logger.info(f"🎬 Animation complete, returning to avatar")
-                    
-                    # Return to avatar
-                    global _image_display_until
-                    _image_display_until = 0
-                    await send_default_avatar()
-                    
-                except asyncio.CancelledError:
-                    logger.info("🎬 GIF animation cancelled")
-                except Exception as e:
-                    logger.error(f"🎬 GIF animation error: {e}", exc_info=True)
-            
-            _gif_animation_task = asyncio.create_task(animate_gif())
+            # Display via DisplayManager
+            await display_manager.show_gif(frames, durations)
             
             return {
                 "status": "success",
@@ -1450,20 +2110,32 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     tts = create_tts_service()
     _current_tts_service = tts
 
-    # LLM: Anthropic Claude with tools
-    llm = AnthropicLLMService(
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
-        model="claude-sonnet-4-20250514",
-    )
+    # LLM: Local (Anthropic + tools) or Gateway (full Clawdbot access)
+    llm_mode = get_llm_mode()
+    logger.info(f"🧠 LLM mode: {llm_mode}")
     
-    # Register tools
-    llm.register_function("handoff_to_clawdbot", handoff_to_clawdbot)
-    llm.register_function("play_sound_effect", play_sound_effect)
-    llm.register_function("analyze_video_frame", analyze_video_frame)
-    llm.register_function("show_generated_image", show_generated_image)
-    llm.register_function("display_gif", display_gif)
-    # DISABLED: change_voice causes pipeline crashes due to dangling async tasks
-    # llm.register_function("change_voice", change_voice)
+    if llm_mode == "gateway":
+        # Gateway mode: All requests go through Clawdbot (full tool access)
+        session_key = get_session_key() or "agent:main:voice"
+        llm = GatewayLLMService(session_key=session_key)
+        # No local tools registered - Gateway handles everything
+        logger.info(f"🌐 Using Gateway LLM (session: {session_key})")
+    else:
+        # Local mode: VB's own Claude with limited tools + handoff
+        llm = AnthropicLLMService(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            model="claude-sonnet-4-20250514",
+        )
+        
+        # Register tools (only in local mode)
+        llm.register_function("handoff_to_clawdbot", handoff_to_clawdbot)
+        llm.register_function("play_sound_effect", play_sound_effect)
+        llm.register_function("analyze_video_frame", analyze_video_frame)
+        llm.register_function("show_generated_image", show_generated_image)
+        llm.register_function("display_gif", display_gif)
+        # DISABLED: change_voice causes pipeline crashes due to dangling async tasks
+        # llm.register_function("change_voice", change_voice)
+        logger.info("🏠 Using Local LLM (Anthropic + tools)")
 
     # Conversation context with Vinston personality
     messages = [
@@ -1547,14 +2219,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         required=["voice"]
     )
     
-    context = LLMContext(messages, tools=ToolsSchema(standard_tools=[
-        handoff_schema, 
-        sound_effect_schema,
-        analyze_video_schema,
-        show_image_schema,
-        display_gif_schema,
-        # change_voice_schema  # DISABLED: causes pipeline crashes
-    ]))
+    # Create context - with tools only in local mode
+    if llm_mode == "gateway":
+        # Gateway mode: no local tools, Gateway has all tools
+        context = LLMContext(messages)
+    else:
+        # Local mode: register tool schemas
+        context = LLMContext(messages, tools=ToolsSchema(standard_tools=[
+            handoff_schema, 
+            sound_effect_schema,
+            analyze_video_schema,
+            show_image_schema,
+            display_gif_schema,
+            # change_voice_schema  # DISABLED: causes pipeline crashes
+        ]))
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
     # RTVI processor for client communication
@@ -1594,11 +2272,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         register_session(session_id, task, tts, context)
         # Set task reference for sound effects and video
         _current_task = task
-        # Send default avatar to video output (wrapped in try/except)
-        try:
-            await send_default_avatar()
-        except Exception as e:
-            logger.error(f"Failed to send avatar on connect: {e}")
+        display_manager.set_task(task)
+        audio_manager.set_task(task)
+        audio_manager.set_tts(tts)
+        # Send default avatar ONLY if not already displaying something
+        # (preserves display state across reconnects)
+        if display_manager.state == DisplayState.AVATAR:
+            try:
+                await display_manager.show_avatar()
+            except Exception as e:
+                logger.error(f"Failed to send avatar on connect: {e}")
+        else:
+            logger.info(f"🖼️ Preserving display state: {display_manager.state.name}")
         
         # Only greet once per session
         if _has_greeted:
@@ -1606,11 +2291,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             return
         _has_greeted = True
         
-        # Greet the user when they connect
+        # Greet the user when they connect (pick random greeting)
+        greeting = get_random_greeting()
+        logger.info(f"🐺 Using greeting: {greeting}")
         messages.append(
             {
                 "role": "system",
-                "content": "A user just connected. Say exactly: 'Vinston here. What needs fixing?'",
+                "content": f"A user just connected. Say exactly: '{greeting}'",
             }
         )
         await task.queue_frames([LLMRunFrame()])
@@ -1622,15 +2309,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         unregister_session(session_id)
         _current_task = None
         _has_greeted = False  # Reset for next connection
-        stop_ambient_sounds()  # Stop any playing ambient sounds
+        await audio_manager.interrupt_all()  # Stop any playing audio
         await task.cancel()
 
     @transport.event_handler("on_user_started_speaking")
     async def on_user_started_speaking(transport):
-        """Stop ambient sounds when user starts speaking."""
-        if is_ambient_sounds_playing():
-            stop_ambient_sounds()
-            logger.info("🔇 User speaking - stopped ambient sounds")
+        """Stop all audio when user starts speaking."""
+        await audio_manager.interrupt_all()
+        logger.info("🔇 User speaking - audio interrupted")
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
     await runner.run(task)
@@ -1726,24 +2412,107 @@ def get_transport_port():
     """Get transport port from config."""
     return get_config("transport.port", 8086)
 
+def get_transport_host():
+    """Get transport host from config."""
+    return get_config("transport.host", None)
+
+def get_transport_proxy():
+    """Get transport proxy from config."""
+    return get_config("transport.proxy", None)
+
+def get_transport_esp32():
+    """Get ESP32 compatibility mode from config."""
+    return get_config("transport.esp32", False)
+
+def get_transport_room():
+    """Get Daily room URL from config (direct connection)."""
+    return get_config("transport.room", None)
+
+def get_transport_folder():
+    """Get downloads folder from config."""
+    return get_config("transport.folder", None)
+
+def get_transport_verbose():
+    """Get verbose logging from config."""
+    return get_config("transport.verbose", False)
+
 
 if __name__ == "__main__":
     import sys
     
-    # Check if transport args already provided via CLI
-    has_transport_arg = any(arg in sys.argv for arg in ['-t', '--transport'])
-    has_port_arg = any(arg in sys.argv for arg in ['-p', '--port'])
+    # Helper to check if arg exists
+    def has_arg(*args):
+        return any(arg in sys.argv for arg in args)
+    
+    # Strip custom args that Pipecat doesn't know about
+    # (they're already parsed by _get_cli_arg and _has_cli_flag at module load)
+    custom_args = [
+        '--config', '-c',
+        '--llm-mode',
+        '--session', '-s',
+        '--session-label',
+        '--require-existing',
+        '--reset-session',
+    ]
+    filtered_argv = [sys.argv[0]]
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in custom_args:
+            # Skip this arg and its value (if it takes one)
+            if arg not in ['--require-existing', '--reset-session']:  # flags without values
+                i += 1  # skip the value too
+        else:
+            filtered_argv.append(arg)
+        i += 1
+    sys.argv = filtered_argv
     
     # Add config values as defaults if not specified on CLI
-    if not has_transport_arg:
+    if not has_arg('-t', '--transport'):
         transport_type = get_transport_type()
         sys.argv.extend(['-t', transport_type])
         logger.info(f"📡 Using transport from config: {transport_type}")
     
-    if not has_port_arg:
+    if not has_arg('-p', '--port'):
         port = get_transport_port()
         sys.argv.extend(['--port', str(port)])
         logger.info(f"📡 Using port from config: {port}")
+    
+    if not has_arg('--host'):
+        host = get_transport_host()
+        if host:
+            sys.argv.extend(['--host', host])
+            logger.info(f"📡 Using host from config: {host}")
+    
+    if not has_arg('-x', '--proxy'):
+        proxy = get_transport_proxy()
+        if proxy:
+            sys.argv.extend(['--proxy', proxy])
+            logger.info(f"📡 Using proxy from config: {proxy}")
+    
+    if not has_arg('--esp32'):
+        if get_transport_esp32():
+            sys.argv.append('--esp32')
+            logger.info("📡 ESP32 compatibility enabled from config")
+    
+    if not has_arg('-d', '--direct'):
+        room = get_transport_room()
+        if room:
+            sys.argv.extend(['--direct'])
+            # Set DAILY_ROOM_URL env var for the room
+            os.environ['DAILY_ROOM_URL'] = room
+            logger.info(f"📡 Using Daily room from config: {room}")
+    
+    if not has_arg('-f', '--folder'):
+        folder = get_transport_folder()
+        if folder:
+            sys.argv.extend(['--folder', folder])
+            logger.info(f"📡 Using folder from config: {folder}")
+    
+    if not has_arg('-v', '--verbose'):
+        if get_transport_verbose():
+            sys.argv.append('--verbose')
+            logger.info("📡 Verbose logging enabled from config")
     
     from pipecat.runner.run import main
     main()

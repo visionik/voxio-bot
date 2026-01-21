@@ -1,8 +1,36 @@
 # Voxio Bot Configuration (voxio.bot)
 
+[llm]
+# LLM mode: "local" or "gateway"
+# - local: VB runs its own Claude with limited tools + handoff (default)
+# - gateway: All LLM calls route through Clawdbot Gateway (full tool access)
+mode = "local"
+
+[session]
+# Session key for Clawdbot handoffs or gateway mode (e.g., "agent:main:main")
+# If not set, uses default routing
+key = "agent:main:voice"
+
+# Session label to resolve (alternative to key)
+# label = "voice assistant"
+
+# Require session to already exist (fail if not found)
+require_existing = false
+
+# Reset session on connect (fresh transcript, same key)
+reset_on_connect = false
+
 [identity]
 name = "Vinston Wolf"
-greeting = "Vinston here. What needs fixing?"
+# Greetings - one is picked at random for each new call
+greetings = [
+    "Vinston here. What needs fixing?",
+    "I'm Vinston Wolf. I solve problems.",
+    "I think fast, I talk fast and I'm ready to help.",
+    "I was 30 seconds away. I got here in 5. What's up?",
+    "Let's get down to brass tacks. How can I help?",
+    "Mmm. This is good coffee. I'm ready to help.",
+]
 
 [stt]
 # Provider: openai, mlx-whisper, whisper
@@ -41,15 +69,18 @@ gap = 0.5
 input_enabled = true
 output_enabled = true
 avatar = "avatar.png"
-# How long to display generated images before returning to avatar (seconds)
-image_display_duration = 300
+
+# Display durations (seconds) before returning to avatar
+capture_display_duration = 60      # Input frame from camera
+gif_display_duration = 120         # GIF animations (2 minutes)
+image_display_duration = 300       # Generated images (5 minutes)
 
 [vision]
 # Vision analysis mode: handoff, direct, or local
 # - handoff: send to Clawdbot for analysis (default)
 # - direct: feed image directly to voice LLM (Claude vision)
 # - local: use a local vision model
-mode = "handoff"
+mode = "local"
 
 # Local vision model (only used when mode = "local")
 # Options: moondream, llava, florence-2
@@ -66,5 +97,15 @@ stop_secs = 0.3
 type = "webrtc"
 # Port for local WebRTC server (webrtc transport only)
 port = 8086
-# Daily.co room URL (daily transport only, or set DAILY_ROOM_URL env)
-# daily_room_url = "https://your-domain.daily.co/room-name"
+# Host address (optional, for binding to specific interface)
+# host = "0.0.0.0"
+# Public proxy hostname (for NAT traversal)
+# proxy = "your-public-hostname.com"
+# Enable ESP32 compatibility mode (SDP munging)
+esp32 = false
+# Connect directly to Daily room (sets transport to daily)
+# room = "https://your-domain.daily.co/room-name"
+# Downloads folder path
+# folder = "/tmp/downloads"
+# Verbose logging
+verbose = false
