@@ -156,7 +156,10 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 logger.info("✅ Silero VAD model loaded")
 
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame, TextFrame, TTSSpeakFrame, InputImageRawFrame, UserImageRawFrame
+from pipecat.frames.frames import (
+    LLMRunFrame, TextFrame, TTSSpeakFrame, InputImageRawFrame, UserImageRawFrame,
+    UserStoppedSpeakingFrame, LLMFullResponseStartFrame,
+)
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -173,6 +176,7 @@ from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.llm_service import LLMService
+from tts_cache import CachedTTSService, FillerInjector, FillerManager, TTSCache, CacheConfig
 from pipecat.frames.frames import TextFrame, LLMFullResponseEndFrame
 
 
@@ -418,6 +422,9 @@ def get_tts_voice():
 def get_tts_model_path():
     return os.getenv("TTS_MODEL_PATH", "")
 
+def get_cache_precache_fillers():
+    return get_config("cache.precache_fillers", True)
+
 def get_video_in_enabled():
     return get_config("video.input_enabled", os.getenv("VIDEO_IN_ENABLED", "false").lower() == "true")
 
@@ -493,6 +500,9 @@ if get_vision_mode() == "local":
     logger.info("🔭 Vision mode is 'local' - loading Moondream at startup...")
     _load_moondream_model()
 
+# Flag for filler precache (triggered in run_bot when event loop is available)
+PRECACHE_FILLERS_ENABLED = TTS_PROVIDER == "elevenlabs" and get_cache_precache_fillers()
+
 # Nano-banana path for image generation
 NANO_BANANA_SCRIPT = "/opt/homebrew/lib/node_modules/clawdbot/skills/nano-banana-pro/scripts/generate_image.py"
 
@@ -549,6 +559,16 @@ def create_stt_service():
         return OpenAISTTService(api_key=os.getenv("OPENAI_API_KEY"))
 
 
+# Global TTS cache (shared across sessions)
+_tts_cache: Optional[TTSCache] = None
+
+def get_tts_cache() -> TTSCache:
+    """Get or create the global TTS cache."""
+    global _tts_cache
+    if _tts_cache is None:
+        _tts_cache = TTSCache(config=CacheConfig.from_file())
+    return _tts_cache
+
 def create_tts_service():
     """Create the appropriate TTS service based on configuration."""
     provider = TTS_PROVIDER
@@ -566,15 +586,16 @@ def create_tts_service():
         }
         voice_id = voice_ids.get(voice.lower(), voice)  # Use as-is if not in map
         
-        logger.info(f"🔊 Using ElevenLabs TTS (cloud) - voice: {voice}")
-        return ElevenLabsTTSService(
+        logger.info(f"🔊 Using ElevenLabs TTS (cloud, cached) - voice: {voice}")
+        return CachedTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             voice_id=voice_id,
             model="eleven_turbo_v2_5",
+            cache=get_tts_cache(),
         )
     
     elif provider == "piper":
-        # Local Piper TTS
+        # Local Piper TTS (no caching - already local)
         from piper_local_tts import PiperLocalTTSService
         
         # Default to ryan-high if no model path specified
@@ -589,11 +610,12 @@ def create_tts_service():
         return PiperLocalTTSService(model_path=model_path)
     
     else:
-        logger.warning(f"Unknown TTS provider '{provider}', falling back to ElevenLabs")
-        return ElevenLabsTTSService(
+        logger.warning(f"Unknown TTS provider '{provider}', falling back to ElevenLabs (cached)")
+        return CachedTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             voice_id="CwhRBWXzGAHq8TQ4Fs17",
             model="eleven_turbo_v2_5",
+            cache=get_tts_cache(),
         )
 
 # ============================================================================
@@ -676,7 +698,9 @@ def unregister_session(session_id: str):
 # CLAWDBOT HANDOFF TOOL
 # ============================================================================
 
-VOICE_SERVER_URL = os.getenv("VOICE_SERVER_URL", "https://voice.ip11.net")
+# Use localhost for callbacks since Clawdbot runs on same machine
+# (public URL has Cloudflare Access which blocks POST requests)
+VOICE_SERVER_URL = os.getenv("VOICE_SERVER_URL", "http://localhost:8086")
 
 
 async def speak_then_play_handoff_sound():
@@ -796,16 +820,12 @@ async def _play_single_sound(sound_file: str) -> float:
         return 0
     
     try:
-        # Read WAV file properties to get duration
+        # Read WAV file properties and PCM data properly
         with wave.open(file_path, 'rb') as wav:
             sample_rate = wav.getframerate()
             n_frames = wav.getnframes()
             duration = n_frames / sample_rate
-        
-        # Read raw audio data (skip 44-byte header)
-        with open(file_path, 'rb') as f:
-            wav_data = f.read()
-            audio_data = wav_data[44:]
+            audio_data = wav.readframes(n_frames)
         
         frame = OutputAudioRawFrame(
             audio=audio_data,
@@ -981,26 +1001,54 @@ async def handoff_to_clawdbot(params) -> dict:
             cmd = ["clawdbot", "wake", "--mode", "now", "--text", full_message]
             logger.info(f"🤖 Handing off to Clawdbot: {task[:100]}...")
         
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,
+        # Use async subprocess to not block the event loop (allows ambient sounds to play)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         
-        if result.returncode == 0:
+        # Speak acknowledgment FIRST, then start ambient sounds
+        acknowledgments = [
+            "Let me check on that.",
+            "One moment.",
+            "Let me look into that.",
+            "Checking now.",
+            "On it.",
+        ]
+        import random
+        ack = random.choice(acknowledgments)
+        
+        if _current_task:
+            try:
+                await _current_task.queue_frame(TTSSpeakFrame(text=ack))
+                logger.info(f"🗣️ Spoke acknowledgment: {ack}")
+                # Wait for TTS to finish before starting ambient
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                logger.warning(f"Could not speak acknowledgment: {e}")
+        
+        # NOW start ambient sounds WHILE waiting
+        await audio_manager.start_ambient()
+        
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.error("Clawdbot wake timed out")
+            # Keep ambient playing - Clawdbot may still respond via /speak
+            return {"status": "pending", "message": "Let me check with my manager. This might take a moment."}
+        
+        if proc.returncode == 0:
             logger.info("✅ Clawdbot wake successful")
-            # Start ambient sounds directly (no spoken acknowledgment)
-            await audio_manager.start_ambient()
-            # Return empty message - Clawdbot will respond via /speak
+            # Ambient already playing - Clawdbot will respond via /speak
             return {"status": "success", "message": ""}
         else:
-            logger.error(f"Clawdbot wake failed: {result.stderr}")
-            return {"status": "error", "message": f"I couldn't reach the main system. {result.stderr}"}
+            await audio_manager.stop_ambient()
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logger.error(f"Clawdbot wake failed: {error_msg}")
+            return {"status": "error", "message": f"I couldn't reach the main system. {error_msg}"}
             
-    except subprocess.TimeoutExpired:
-        logger.error("Clawdbot wake timed out")
-        return {"status": "pending", "message": "Let me check with my manager. This might take a moment."}
     except FileNotFoundError:
         logger.error("clawdbot command not found")
         return {"status": "error", "message": "I'm sorry, the main system is not available right now."}
@@ -1440,10 +1488,8 @@ class AudioManager:
                 sample_rate = wav.getframerate()
                 n_frames = wav.getnframes()
                 duration = n_frames / sample_rate
-            
-            with open(file_path, 'rb') as f:
-                wav_data = f.read()
-                audio_data = wav_data[44:]  # Skip WAV header
+                # Read PCM data properly (handles variable header sizes)
+                audio_data = wav.readframes(n_frames)
             
             frame = OutputAudioRawFrame(
                 audio=audio_data,
@@ -2109,6 +2155,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     global _current_tts_service
     tts = create_tts_service()
     _current_tts_service = tts
+    
+    # Pre-cache fillers and greetings in background if enabled
+    if PRECACHE_FILLERS_ENABLED and hasattr(tts, 'cache'):
+        voice_id = getattr(tts, '_voice_id', TTS_VOICE)
+        # Precache fillers
+        asyncio.create_task(tts.cache.precache_fillers(voice_id, background=False))
+        logger.info(f"🎭 Filler pre-caching started for voice {voice_id[:8]}...")
+        # Precache greetings
+        greetings = get_config("identity.greetings", [])
+        if greetings:
+            asyncio.create_task(tts.cache.precache(greetings, voice_id))
+            logger.info(f"👋 Greeting pre-caching started ({len(greetings)} phrases)")
 
     # LLM: Local (Anthropic + tools) or Gateway (full Clawdbot access)
     llm_mode = get_llm_mode()
@@ -2237,20 +2295,34 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     # RTVI processor for client communication
     rtvi = RTVIProcessor()
+    
+    # Filler manager for natural conversation flow (plays "Hmm", "Got it" while waiting)
+    # Uses event-based approach - not in pipeline, injects audio directly to transport
+    filler_manager = None
+    logger.debug(f"🎭 Filler check: PRECACHE_FILLERS_ENABLED={PRECACHE_FILLERS_ENABLED}, hasattr(tts,'cache')={hasattr(tts, 'cache')}")
+    if PRECACHE_FILLERS_ENABLED and hasattr(tts, 'cache'):
+        voice_id = getattr(tts, '_voice_id', TTS_VOICE)
+        filler_manager = FillerManager(
+            transport_output=transport.output(),
+            cache=tts.cache,
+            voice_id=voice_id,
+            play_acknowledgment=True,
+            play_thinking=False,  # Only ack for now, thinking can be noisy
+        )
+        logger.info(f"🎭 FillerManager enabled (event-based)")
 
     # Build the pipeline: audio in → STT → LLM → TTS → audio out
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Audio/video from browser
-            rtvi,  # RTVI protocol handling
-            stt,  # Speech-to-text (OpenAI Whisper)
-            user_aggregator,  # Collect user messages
-            llm,  # Language model (Claude)
-            tts,  # Text-to-speech (ElevenLabs)
-            transport.output(),  # Audio to browser
-            assistant_aggregator,  # Collect assistant responses
-        ]
-    )
+    pipeline_stages = [
+        transport.input(),  # Audio/video from browser
+        rtvi,  # RTVI protocol handling
+        stt,  # Speech-to-text (OpenAI Whisper)
+        user_aggregator,  # Collect user messages
+        llm,  # Language model (Claude)
+        tts,  # Text-to-speech (ElevenLabs)
+        transport.output(),  # Audio to browser
+        assistant_aggregator,  # Collect assistant responses
+    ]
+    pipeline = Pipeline(pipeline_stages)
 
     # Video frame capture observer
     video_observer = VideoFrameCaptureObserver()
@@ -2264,10 +2336,53 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         observers=[RTVIObserver(rtvi), video_observer],
     )
 
+    # Filler event handlers (event-based, not in pipeline)
+    if filler_manager:
+        # Initialize filler manager (load cached audio)
+        asyncio.create_task(filler_manager.initialize())
+        
+        # Set up frame filter for events we care about
+        task.set_reached_downstream_filter((UserStoppedSpeakingFrame, LLMFullResponseStartFrame))
+        
+        @task.event_handler("on_frame_reached_downstream")
+        async def on_filler_frame(task, frame):
+            if isinstance(frame, UserStoppedSpeakingFrame):
+                await filler_manager.on_user_stopped_speaking()
+            elif isinstance(frame, LLMFullResponseStartFrame):
+                await filler_manager.cancel()
+
+        # Keep-alive task to prevent WebRTC timeout during silence
+    _keepalive_task = None
+    
+    async def keepalive_loop():
+        """Send silent audio frames periodically to keep connection alive."""
+        from pipecat.frames.frames import OutputAudioRawFrame
+        silence = bytes(480)  # 10ms of silence at 24kHz mono 16-bit
+        while True:
+            try:
+                await asyncio.sleep(15)  # Every 15 seconds
+                frame = OutputAudioRawFrame(
+                    audio=silence,
+                    sample_rate=24000,
+                    num_channels=1,
+                )
+                await transport.output().send_audio(frame)
+                logger.debug("💓 Keep-alive sent")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Keep-alive error (likely disconnected): {e}")
+                break
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
+        nonlocal _keepalive_task
         global _current_task, _has_greeted
         logger.info(f"🐺 Client connected to Vinston (session: {session_id})")
+        
+        # Start keep-alive task
+        _keepalive_task = asyncio.create_task(keepalive_loop())
+        logger.info("💓 Keep-alive started (15s interval)")
         # Register this session for external access
         register_session(session_id, task, tts, context)
         # Set task reference for sound effects and video
@@ -2304,8 +2419,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
+        nonlocal _keepalive_task
         global _current_task, _has_greeted
         logger.info(f"Client disconnected from Vinston (session: {session_id})")
+        
+        # Cancel keep-alive task
+        if _keepalive_task and not _keepalive_task.done():
+            _keepalive_task.cancel()
+            logger.info("💓 Keep-alive stopped")
+        
         unregister_session(session_id)
         _current_task = None
         _has_greeted = False  # Reset for next connection

@@ -44,6 +44,14 @@ provider = "elevenlabs"
 # Voice ID (for ElevenLabs)
 voice = "QzTKubutNn9TjrB7Xb2Q"
 
+[cache]
+# TTS cache directory
+dir = "~/.cache/voxio-tts"
+# Max age of cached files before cleanup (days, 0 = no cleanup)
+max_age_days = 30
+# Pre-cache filler phrases on startup
+precache_fillers = true
+
 [handoff]
 # Type: none, prompt, ambient
 # - none: no sound while waiting
@@ -60,6 +68,17 @@ files = [
     "sounds/110451__freeborn__paper01.wav",
     "sounds/377260__johnnypanic__clearing-throat-2.wav",
     "sounds/414819__bokal__office-drawer.wav",
+    "sounds/60-writing.wav",
+    "sounds/484659__inspectorj__cd-player.wav",
+    "sounds/acura-nsx-idle.wav",
+    "sounds/pulp-fiction-clip.wav",
+    "sounds/pulp-fiction-clip2.wav",
+    "sounds/pulp-fiction-clip3.wav",
+    "sounds/pulp-fiction-clip4.wav",
+    "sounds/pulp-fiction-clip5.wav",
+    "sounds/winston-wolf.wav",
+    "sounds/winston-wolf2.wav",
+    "sounds/403137__blouhond__office-chair.wav",
 ]
 
 # Gap between ambient sounds (seconds)
