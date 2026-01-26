@@ -1,0 +1,198 @@
+version: '3'
+
+set: [errexit, nounset, pipefail]
+
+vars:
+  PYTHON: python3
+  SRC_DIR: .
+  TEST_DIR: tests
+  COV_MIN: 85
+
+tasks:
+  default:
+    desc: List all tasks
+    cmds:
+      - task --list
+    silent: true
+
+  # ==========================================================================
+  # Development
+  # ==========================================================================
+
+  dev:
+    desc: Start development server
+    cmds:
+      - uv run python run_auth.py --port 8086
+
+  dev:gateway:
+    desc: Start in gateway mode (full Clawdbot access)
+    cmds:
+      - uv run python bot.py --llm-mode gateway
+
+  # ==========================================================================
+  # Formatting & Linting
+  # ==========================================================================
+
+  fmt:
+    desc: Format code with ruff
+    sources:
+      - '**/*.py'
+    cmds:
+      - uv run ruff format {{.SRC_DIR}}
+
+  lint:
+    desc: Lint code with ruff
+    sources:
+      - '**/*.py'
+    cmds:
+      - uv run ruff check {{.SRC_DIR}} --fix
+
+  lint:strict:
+    desc: Lint without auto-fix
+    cmds:
+      - uv run ruff check {{.SRC_DIR}}
+
+  type:
+    desc: Type check with mypy
+    sources:
+      - '**/*.py'
+    cmds:
+      - uv run mypy {{.SRC_DIR}} --ignore-missing-imports
+
+  # ==========================================================================
+  # Testing
+  # ==========================================================================
+
+  test:
+    desc: Run all tests
+    deps: [fmt, lint]
+    cmds:
+      - uv run pytest {{.TEST_DIR}} -v
+
+  test:unit:
+    desc: Run unit tests only
+    cmds:
+      - uv run pytest {{.TEST_DIR}}/unit -v
+
+  test:integration:
+    desc: Run integration tests only
+    cmds:
+      - uv run pytest {{.TEST_DIR}}/integration -v
+
+  test:coverage:
+    desc: Run tests with coverage report (must be ≥{{.COV_MIN}}%)
+    cmds:
+      - uv run pytest {{.TEST_DIR}} --cov={{.SRC_DIR}} --cov-report=term-missing --cov-report=html --cov-fail-under={{.COV_MIN}}
+
+  test:watch:
+    desc: Run tests in watch mode
+    cmds:
+      - uv run pytest-watch {{.TEST_DIR}}
+
+  # ==========================================================================
+  # Quality Checks
+  # ==========================================================================
+
+  quality:
+    desc: Run all quality checks (fmt, lint, type)
+    deps: [fmt, lint, type]
+
+  check:
+    desc: Pre-commit checks (MUST pass before commit)
+    deps: [quality, test]
+    cmds:
+      - echo "✅ All checks passed!"
+
+  # ==========================================================================
+  # Cache Management
+  # ==========================================================================
+
+  cache:precache:
+    desc: Pre-cache filler phrases for current voice
+    cmds:
+      - uv run python precache_fillers.py
+
+  cache:list:
+    desc: List cached filler phrases
+    cmds:
+      - uv run python precache_fillers.py --list
+
+  cache:clear:
+    desc: Clear TTS cache
+    cmds:
+      - rm -rf ~/.cache/voxio-tts/*
+      - rm -rf ~/.cache/voxio-fillers/*
+      - echo "✅ Cache cleared"
+
+  # ==========================================================================
+  # Dependencies
+  # ==========================================================================
+
+  deps:
+    desc: Install dependencies
+    cmds:
+      - uv sync
+
+  deps:dev:
+    desc: Install dev dependencies
+    cmds:
+      - uv add --dev pytest pytest-cov pytest-mock pytest-asyncio hypothesis ruff mypy
+
+  deps:update:
+    desc: Update dependencies
+    cmds:
+      - uv sync --upgrade
+
+  deps:export:
+    desc: Export requirements.txt
+    cmds:
+      - uv pip compile pyproject.toml -o requirements.txt
+
+  # ==========================================================================
+  # Cleanup
+  # ==========================================================================
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf __pycache__ .pytest_cache .mypy_cache .ruff_cache
+      - rm -rf htmlcov .coverage coverage.xml
+      - rm -rf dist build *.egg-info
+      - find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+      - echo "✅ Cleaned"
+
+  clean:all:
+    desc: Clean everything including cache
+    deps: [clean, cache:clear]
+
+  # ==========================================================================
+  # Docker (future)
+  # ==========================================================================
+
+  docker:build:
+    desc: Build Docker image
+    cmds:
+      - docker build -t voxio-bot:latest .
+    status:
+      - test -f Dockerfile
+
+  docker:run:
+    desc: Run in Docker container
+    cmds:
+      - docker run -p 8086:8086 --env-file .env voxio-bot:latest
+    status:
+      - test -f Dockerfile
+
+  # ==========================================================================
+  # Release
+  # ==========================================================================
+
+  version:
+    desc: Show current version
+    cmds:
+      - grep "version" pyproject.toml | head -1
+
+  changelog:
+    desc: Generate changelog from git commits
+    cmds:
+      - git log --oneline --no-decorate -20

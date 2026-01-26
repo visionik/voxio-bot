@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Real-time voice assistant with Claude and ElevenLabs using Pipecat"
 requires-python = ">=3.10,<3.14"
 dependencies = [
+    "aiofiles>=24.1.0",
     "aiohttp>=3.13.3",
+    "elevenlabs>=2.0.0",
     "onnxruntime>=1.23.2",
     "pillow>=11.3.0",
     "pipecat-ai[anthropic,daily,deepgram,elevenlabs,mlx-whisper,moondream,runner,silero,webrtc]",
@@ -12,14 +14,129 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.12",
+    "pytest-asyncio>=0.23",
+    "hypothesis>=6.0",
+    "ruff>=0.12.0",
+    "mypy>=1.7",
+    "pyright>=1.1.404",
+]
+
 [dependency-groups]
 dev = [
-    "pyright>=1.1.404,<2",
-    "ruff>=0.12.11,<1",
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.12",
+    "pytest-asyncio>=0.23",
+    "hypothesis>=6.0",
+    "ruff>=0.12.0",
+    "mypy>=1.7",
+    "pyright>=1.1.404",
 ]
+
+# =============================================================================
+# Pytest Configuration
+# =============================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "unit: Unit tests (fast, no external deps)",
+    "integration: Integration tests (may use external services)",
+    "slow: Slow tests (skipped by default)",
+]
+
+# =============================================================================
+# Coverage Configuration
+# =============================================================================
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "*/.venv/*",
+    "*/venv/*",
+    "*/__pycache__/*",
+    "run.py",
+    "run_auth.py",
+    "bot.py",  # Entry point with complex dependencies
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+# =============================================================================
+# Ruff Configuration
+# =============================================================================
 
 [tool.ruff]
 line-length = 100
+target-version = "py311"
 
 [tool.ruff.lint]
-select = ["I"]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # Pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "A",    # flake8-builtins
+    "C4",   # flake8-comprehensions
+    "DTZ",  # flake8-datetimez
+    "T10",  # flake8-debugger
+    "PIE",  # flake8-pie
+    "PT",   # flake8-pytest-style
+    "RET",  # flake8-return
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "B008",  # Do not perform function calls in argument defaults
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["voxio_bot"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# =============================================================================
+# MyPy Configuration
+# =============================================================================
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Relaxed for Pipecat compatibility
+ignore_missing_imports = true
+check_untyped_defs = true
