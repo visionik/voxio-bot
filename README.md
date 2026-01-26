@@ -547,7 +547,159 @@ http://<tailscale-ip>:8086/client
 
 ### TURN Servers
 
-For WebRTC connections through NAT/firewalls, configure a TURN server. Recommended: [Cloudflare TURN](https://developers.cloudflare.com/calls/turn/) (free tier available).
+WebRTC uses peer-to-peer connections for real-time audio/video. When direct connections fail (NAT, firewalls, VPNs), a **TURN server** relays traffic.
+
+#### When You Need TURN
+
+| Scenario | TURN Required? |
+|----------|----------------|
+| Same local network | ❌ No |
+| Home → Home (different networks) | ⚠️ Maybe |
+| Behind corporate firewall | ✅ Yes |
+| Mobile/cellular networks | ✅ Yes |
+| VPN connections | ✅ Yes |
+| Symmetric NAT | ✅ Yes |
+
+#### TURN Server Providers
+
+| Provider | Type | Cost | Notes |
+|----------|------|------|-------|
+| [Cloudflare TURN](https://developers.cloudflare.com/calls/turn/) | Managed | Free tier | **Recommended**, global network |
+| [Twilio TURN](https://www.twilio.com/docs/stun-turn) | Managed | Usage-based | Reliable, good docs |
+| [Xirsys](https://xirsys.com/) | Managed | Free tier + paid | Popular for WebRTC |
+| [coturn](https://github.com/coturn/coturn) | Self-hosted | Free | Run your own server |
+| [Pion TURN](https://github.com/pion/turn) | Self-hosted | Free | Go-based, lightweight |
+
+#### Configuration
+
+Add ICE servers to `config.toml`:
+
+```toml
+[transport]
+type = "webrtc"
+port = 8086
+
+# ICE/TURN server configuration
+ice_servers = [
+    # STUN server (free, for NAT discovery)
+    "stun:stun.l.google.com:19302",
+    
+    # TURN server (for relay when direct fails)
+    # Format: turn:host:port?transport=udp
+]
+
+# For authenticated TURN servers, use environment variables
+# TURN_USERNAME and TURN_CREDENTIAL
+```
+
+#### Cloudflare TURN Setup (Recommended)
+
+1. **Enable Cloudflare Calls** in your Cloudflare dashboard
+
+2. **Generate credentials**:
+```bash
+curl -X POST "https://rtc.live.cloudflare.com/v1/turn/keys/<key-id>/credentials/generate" \
+  -H "Authorization: Bearer <api-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"ttl": 86400}'
+```
+
+3. **Add to environment**:
+```bash
+# .env
+TURN_SERVER="turn:turn.cloudflare.com:3478"
+TURN_USERNAME="<generated-username>"
+TURN_CREDENTIAL="<generated-credential>"
+```
+
+4. **Configure in config.toml**:
+```toml
+[transport]
+ice_servers = [
+    "stun:stun.cloudflare.com:3478",
+]
+turn_server = "${TURN_SERVER}"
+turn_username = "${TURN_USERNAME}"
+turn_credential = "${TURN_CREDENTIAL}"
+```
+
+#### Self-Hosted TURN with coturn
+
+1. **Install coturn**:
+```bash
+# Ubuntu/Debian
+sudo apt install coturn
+
+# macOS
+brew install coturn
+```
+
+2. **Configure** `/etc/turnserver.conf`:
+```ini
+# Network
+listening-port=3478
+tls-listening-port=5349
+listening-ip=0.0.0.0
+external-ip=YOUR_PUBLIC_IP
+relay-ip=YOUR_PRIVATE_IP
+
+# Authentication
+lt-cred-mech
+user=voxio:your-secret-password
+realm=your-domain.com
+
+# Security
+fingerprint
+no-multicast-peers
+no-cli
+
+# Logging
+log-file=/var/log/turnserver.log
+verbose
+```
+
+3. **Start coturn**:
+```bash
+sudo systemctl enable coturn
+sudo systemctl start coturn
+```
+
+4. **Configure Voxio Bot**:
+```toml
+[transport]
+ice_servers = [
+    "stun:your-server.com:3478",
+]
+turn_server = "turn:your-server.com:3478"
+turn_username = "voxio"
+turn_credential = "your-secret-password"
+```
+
+#### Testing TURN Connectivity
+
+Use [Trickle ICE](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/) to test your TURN server:
+
+1. Open the test page
+2. Add your TURN server URL with credentials
+3. Click "Gather candidates"
+4. Look for `relay` candidates (indicates TURN is working)
+
+#### Troubleshooting TURN
+
+| Issue | Solution |
+|-------|----------|
+| No relay candidates | Check TURN server is running and reachable |
+| Authentication failed | Verify username/credential match server config |
+| Connection timeout | Check firewall allows UDP 3478 and TCP 443 |
+| Works locally, fails remotely | TURN server's external-ip may be misconfigured |
+
+#### Security Best Practices
+
+1. **Rotate credentials** regularly (use short TTLs with Cloudflare)
+2. **Use TLS** for TURN (port 5349) when possible
+3. **Restrict relay IPs** to prevent abuse
+4. **Monitor usage** to detect unauthorized access
+5. **Rate limit** connections per user
 
 ---
 
