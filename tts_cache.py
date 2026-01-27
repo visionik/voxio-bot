@@ -694,6 +694,7 @@ class FillerManager:
         self._cancelled = False
         self._state_lock = asyncio.Lock()
         self._initialized = False
+        self._last_filler: dict[str, str] = {}  # Track last filler per category to avoid repeats
         
         logger.info(f"🎭 FillerManager initialized (voice: {voice_id[:8]}...)")
     
@@ -725,10 +726,18 @@ class FillerManager:
             logger.debug(f"🔥 Hot-loaded filler: {text}")
     
     def _get_random_filler(self, category: str) -> Optional[tuple[str, bytes]]:
-        """Get a random loaded filler from category."""
+        """Get a random loaded filler from category, avoiding last played."""
         phrases = FILLER_CATEGORIES.get(category, [])
         available = [(p, self._loaded[p]) for p in phrases if p in self._loaded]
-        return random.choice(available) if available else None
+        if not available:
+            return None
+        # Avoid repeating last filler in this category
+        last = self._last_filler.get(category)
+        if last and len(available) > 1:
+            available = [(p, a) for p, a in available if p != last]
+        chosen = random.choice(available)
+        self._last_filler[category] = chosen[0]
+        return chosen
     
     async def _send_audio(self, audio: bytes):
         """Send audio directly to transport."""
@@ -841,6 +850,9 @@ class FillerInjector(FrameProcessor):
         # Pre-loaded fillers for instant access
         self._loaded: Dict[str, bytes] = {}
         
+        # Track last filler per category to avoid repeats
+        self._last_filler: Dict[str, str] = {}
+        
         # Track if we've initialized
         self._initialized = False
         
@@ -882,10 +894,18 @@ class FillerInjector(FrameProcessor):
         await self._load_fillers()
     
     def _get_random_filler(self, category: str) -> Optional[tuple[str, bytes]]:
-        """Get a random loaded filler from category."""
+        """Get a random loaded filler from category, avoiding last played."""
         phrases = FILLER_CATEGORIES.get(category, [])
         available = [(p, self._loaded[p]) for p in phrases if p in self._loaded]
-        return random.choice(available) if available else None
+        if not available:
+            return None
+        # Avoid repeating last filler in this category
+        last = self._last_filler.get(category)
+        if last and len(available) > 1:
+            available = [(p, a) for p, a in available if p != last]
+        chosen = random.choice(available)
+        self._last_filler[category] = chosen[0]
+        return chosen
     
     async def _play_audio(self, audio: bytes):
         """Push audio frames to pipeline."""

@@ -1329,7 +1329,7 @@ class AudioManager:
         self._task: Optional["PipelineTask"] = None
         self._ambient_task: Optional[asyncio.Task] = None
         self._tts_service = None  # Reference to TTS service
-        self._last_ambient_file: Optional[str] = None  # Track last played to avoid repeats
+        self._recent_ambient_files: list = []  # Track last 5 played to avoid repeats
         
     def set_task(self, task):
         """Set the Pipecat task reference."""
@@ -1393,10 +1393,15 @@ class AudioManager:
                         await asyncio.sleep(0.5)
                         continue
                     
-                    # Pick random file, avoiding last played (if more than 1 file)
-                    available = [f for f in files if f != self._last_ambient_file] if len(files) > 1 else files
+                    # Pick random file, avoiding last 5 played (if enough files)
+                    available = [f for f in files if f not in self._recent_ambient_files]
+                    if not available:  # All files recently played, reset
+                        available = files
                     sound_file = random.choice(available)
-                    self._last_ambient_file = sound_file
+                    # Track last 5 played
+                    self._recent_ambient_files.append(sound_file)
+                    if len(self._recent_ambient_files) > 5:
+                        self._recent_ambient_files.pop(0)
                     
                     duration = await self._play_sound(sound_file)
                     
